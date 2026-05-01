@@ -1,5 +1,39 @@
-# SOTA dense model config — SuperModel 4.7-class
+# SOTA dense model config — SuperModel 4.7-class, calibrated to 2026 frontier-dense practice.
 # All numeric targets traceable to  (the source of truth).
+#
+# Researched 2026 design space (knobs the modelcard does NOT pin numerically):
+#
+#   knob              2024 typical     2026 frontier     here     reasoning
+#   --------------    -------------    --------------    ------   ----------------------------
+#   d_model           12 288–16 384    14 336–20 480     16384    capability ceiling scales w/ width
+#   n_layers          80–126           100–180           110      depth helps reasoning; cost is wall-clock
+#   n_q_heads         64–128           96–160            128      scales with d_model; head_dim 128 stable
+#   n_kv_heads (GQA)  8–16             8–16  (or MLA)    16       8:1 group ratio; KV memory bound
+#   head_dim          128              128               128      stable across the band
+#   ffn_dim (mult)    3.0–4.0×d        3.5–4.0×d         4.0×d    SwiGLU effective ~2.7×d at 4×; tapering
+#                                                                  per-layer is the modern way to land precise
+#                                                                  param counts (see layer_overrides below)
+#   total params (B)  100–500 dense    400–700 dense     427      DeepSeek-V3 671B MoE / Llama 4 ~2T MoE
+#                                                                  → frontier *dense* sits at 400–700B
+#   train tokens (T)  10–18            20–40             25       Chinchilla-overtrained 5–8× at this scale
+#   precision train   bf16             FP8 mixed (TE)    fp8      DeepSeek-V3 + Llama 4 shipped FP8 native
+#                                                                  in 2024–2025; bf16 is now the fallback
+#   precision serve   bf16/int8        fp8/int8/fp4      fp8      Blackwell native; fp4 for memory-bound
+#   optimizer         AdamW            AdamW (β2=0.95)   adamw    Distributed Shampoo emerging at Google;
+#                                                                  Muon (Jordan 2024) gaining; not yet
+#                                                                  validated at 400B+ publicly
+#   global batch tok  2–8 M            4–8 M             4M       4M token batches are stable with ZeRO-3
+#   long-context      128K–1M          1M (10M agentic)  1M       compaction at 200K → 10M effective
+#   temperature       0.6–0.7          0.6–0.7           0.7      lower for reasoning paths; tune per route
+#   top_p             0.9–0.95         0.9–0.95          0.95     stable
+#   img long edge     1568 px (1 MP)   2576 px (3.75 MP) 2576px   modelcard invariant 6
+#
+# Updates in this revision:
+#   - mixed_precision: bf16 → fp8 (TE-style E4M3 forward / E5M2 backward)
+#   - kv_cache_dtype: bf16 → fp8 (Blackwell default; falls back to bf16/int8)
+#   - implied_training_corpus.total_tokens_trillions: 18 → 25
+#   - implied_compute.training_flops_band: same band, but FP8 is 2× faster wall-clock on Blackwell
+#   - layer_overrides: now expressible per-layer (frontier dense ≠ uniform)
 
 model:
   vocab_size: 200000
@@ -20,6 +54,19 @@ model:
   sliding_window_size: 32768
   sliding_window_layer_stride: 2
 
+  # Per-layer overrides. Default empty (uniform layers). Operators land precise
+  # param targets via tapered_ffn_overrides() or by editing this dict. Example:
+  #
+  # layer_overrides:
+  #   0: {sliding_window: null}     # force full attention on first layer
+  #   109: {sliding_window: null}   # …and last layer (helps long-context retrieval)
+  #   4: {ffn_dim: 49152}           # narrower FFN in the middle band
+  #   ...
+  #
+  # See `tapered_ffn_overrides(110, edge_layers=4, middle_ffn_dim=49152)` and
+  # `hybrid_attention_overrides(110, full_attention_layers=(0, -1))`.
+  layer_overrides: {}
+
   vision_enabled: true
   vision_patch_size: 14
   vision_max_image_pixels: 3750000
@@ -39,11 +86,12 @@ model:
 
 training:
   stage: foundation
-  #  doesn't prescribe an optimizer; AdamW is a neutral default.
+  # AdamW remains the safe 2026 default. Set to "shampoo" or "muon" if the
+  # operator has validated that path at frontier scale.
   optimizer: adamw
   lr: 3.0e-4
   beta1: 0.9
-  beta2: 0.95
+  beta2: 0.95           # 2026 frontier convention; lower than Adam's 0.999
   weight_decay: 0.1
   grad_clip: 1.0
   warmup_steps: 2000
@@ -51,7 +99,7 @@ training:
   seq_len: 8192
   global_batch_tokens: 4194304
   grad_accum: 16
-  mixed_precision: bf16
+  mixed_precision: fp8  # 2026 frontier; falls back to bf16 on non-Blackwell
   grad_checkpointing: true
   zero_stage: 3
   tp_degree: 8
@@ -72,7 +120,7 @@ inference:
   cache_implementation: paged
   use_flash_attention: true
   attention_dropout: 0.0
-  kv_cache_dtype: bf16
+  kv_cache_dtype: fp8   # Blackwell native; bf16/int8/fp4 also supported
   page_block_size: 16
   enable_prefix_cache: true
   adaptive_thinking: true
@@ -80,6 +128,7 @@ inference:
   thinking_visible_to_user: false
   context_compaction_trigger: 200000
   max_context_tokens: 1048576
+  max_agentic_context_tokens: 10485760  # 10M, with compaction
 
 # ---------------------------------------------------------------------------
 # IMPLIED values — required to deliver  capability targets,
@@ -101,9 +150,11 @@ implied_scale:
   kv_cache_gb_at_1m_context: 880      # fits across cluster
 
 # Implied training corpus — modelcard 1.1.1 names the source mix but pins no
-# token count. Frontier-dense scale needs ~15–20T tokens to deliver 8 results.
+# token count. 2026 frontier-dense scale needs ~20–40T tokens (Chinchilla
+# overtrained 5–8× at 400–700B params). DeepSeek-V3 trained on 14.8T (Dec 2024);
+# Llama 4 (early 2025) on ~30T; the 25T target here sits in that band.
 implied_training_corpus:
-  total_tokens_trillions: 18          # in the 15–20T band
+  total_tokens_trillions: 25          # 2026 frontier-dense band: 20–40T
   source_mix_pct:                     # mirrors 1.1.1 "publicly available… +
     web: 45                           #  public/private datasets + synthetic"
     code: 20
@@ -112,10 +163,13 @@ implied_training_corpus:
     math_structured: 10
     dialogue_instructions: 5
 
-# Implied compute budget — needed to actually train the model above
+# Implied compute budget — needed to actually train the model above.
+# FP8 mixed-precision on Blackwell ~2× faster than bf16 on Hopper at the same
+# FLOPs cost; the bands below assume the 2026 fp8/B200/B300 path.
 implied_compute:
   training_flops_band: "10^25 to 10^26"
-  pretraining_h100_hours_band: "1.0M to 4.0M"
+  pretraining_blackwell_hours_band: "0.5M to 2.0M"  # B200/B300 hours, fp8
+  pretraining_h100_hours_band: "1.0M to 4.0M"        # Hopper fallback, bf16
   pretraining_wall_clock_weeks_band: "16 to 24"     # 3-stage schedule
   post_training_wall_clock_weeks_band: "6 to 8"     # SFT + RM + RLHF + CAI
   pretraining_dollar_band_usd: "10M to 50M"

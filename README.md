@@ -62,39 +62,110 @@ Adjacent constraints from ``:
 
 ## 1. Transformer Architecture
 
-A dense decoder-only transformer at the **150–200B active-parameter** scale. All parameters active at inference (no MoE routing).
+A dense decoder-only transformer at the **frontier-dense band** — ~427B active parameters at the YAML defaults, in the 400–700B band that 2026 frontier-dense (Llama 4 dense backbone, Claude Opus 4.x, Gemini Ultra dense subset) lives in. All parameters active at inference (no MoE routing).
 
 ### 1.1 Topology
 
 ```
 Hidden dimension (d_model):        16,384
-Layers:                            96–110
+Layers:                            110             (frontier dense 2026: 100–180)
 Attention heads (Q):               128
-Attention heads (KV, GQA):         8–16        # see 1.3
+Attention heads (KV, GQA):         16              (8:1 group ratio)
 Head dimension:                    128
-FFN dimension:                     65,536      # 4 × d_model
+FFN dimension:                     65,536          (4 × d_model SwiGLU)
 FFN activation:                    SwiGLU
-Vocabulary:                        128,000–256,000
+Vocabulary:                        200,000         (covers modelcard 8.12 44 langs)
 Tied embeddings:                   no
 RMSNorm (pre-norm) on attn + FFN
 Position encoding:                 RoPE, base 10⁶ for long context
-Long-context extension:            YaRN / NTK-aware scaling to 1M tokens
-Dtype (training):                  bfloat16 mixed precision
-Dtype (inference):                 bfloat16 default; int8 / int4 for memory-tight deployments
+Long-context extension:            YaRN scaling to 1M tokens
+Per-layer heterogeneity:           expressible via ModelConfig.layer_overrides
+                                   (frontier dense is NOT uniform — see 1.2.1)
+Dtype (training):                  FP8 mixed precision (E4M3 fwd / E5M2 bwd)
+                                   bf16 fallback on pre-Blackwell hardware
+Dtype (inference):                 FP8 KV cache by default; bf16/int8/fp4 also supported
+Total params at the YAML defaults: ≈ 427 B (run cfg.estimate_params_billions())
 ```
+
+### 1.1.1 The 2026 frontier-dense design space
+
+`` doesn't pin numbers for `d_model`, `n_layers`, `n_kv_heads`, `ffn_dim`, optimizer, precision, total params, training tokens, or sampling. Only **7** numerical/structural choices are modelcard-pinned (the 1M context, the 2576px / 3.75 MP image cap, the 200K compaction trigger, and adaptive thinking + tier names); the rest are **operator-committed**. The `model:` and `training:` sections of `configs/sota_4_7.yaml` are calibrated against published 2026 frontier-dense practice.
+
+The table below is the same one in the YAML preamble — it's the working set of permutations to consider when adjusting. The full sensitivity / combination analysis (param-count cross-products, KV-cache memory by `n_kv_heads × dtype`, training-FLOPs by `P × tokens`, worked recipes for landing 200B/427B/600B/1T) is in **[`docs/PERMUTATIONS.md`](./docs/PERMUTATIONS.md)**.
+
+| Knob | 2024 typical | 2026 frontier band | This repo | Notes |
+|---|---|---|---|---|
+| `d_model` | 12,288–16,384 | 14,336–20,480 | 16,384 | capability ceiling scales with width |
+| `n_layers` | 80–126 | 100–180 | 110 | depth helps reasoning; cost is wall-clock |
+| `n_q_heads` | 64–128 | 96–160 | 128 | scales with d_model; head_dim=128 stable |
+| `n_kv_heads` (GQA) | 8–16 | 8–16 (or MLA) | 16 | 8:1 group ratio; KV memory bound |
+| `head_dim` | 128 | 128 | 128 | stable across the band |
+| `ffn_dim` (× d_model) | 3.0–4.0 | 3.5–4.0 | 4.0 | SwiGLU; tapering across depth is modern |
+| Total params (B, dense) | 100–500 | 400–700 | 427 | DeepSeek-V3 is 671B MoE; Llama 4 ~2T MoE → frontier *dense* sits at 400–700B |
+| Training tokens (T) | 10–18 | 20–40 | 25 | Chinchilla-overtrained 5–8× at this scale |
+| Train precision | bf16 | FP8 mixed (TE) | fp8 | DeepSeek-V3 + Llama 4 shipped FP8 native — see [`docs/PRECISION.md`](./docs/PRECISION.md) |
+| Serve precision | bf16 / int8 | fp8 / int8 / fp4 | fp8 | Blackwell native; fp4 for memory-bound |
+| Optimizer | AdamW | AdamW (β2=0.95) | adamw | Distributed Shampoo + Muon emerging |
+| Global batch (tok) | 2–8 M | 4–8 M | 4 M | stable with ZeRO-3 |
+| Long context | 128K–1M | 1M (10M agentic) | 1M | compaction at 200K → 10M effective |
+| `temperature` | 0.6–0.7 | 0.6–0.7 | 0.7 | lower for reasoning paths |
+| `top_p` | 0.9–0.95 | 0.9–0.95 | 0.95 | stable |
+| Image long edge | 1568 px (1 MP) | 2576 px (3.75 MP) | 2576 px | modelcard invariant 6 |
 
 ### 1.2 Why dense, not MoE — and why coding capability isn't dead weight
 
-`` describes a frontier model evaluated as a single 200B-parameter inference unit (no routing latency, no expert balancing pathologies). Dense at this scale gives:
+`` describes a frontier model evaluated as a single dense inference unit (no routing latency, no expert balancing pathologies). Dense at this scale gives:
 - Predictable latency under tool-use and adaptive-thinking modes.
 - Cleaner attribution for white-box safety analysis (SAE features, evaluation-awareness probes — see modelcard 6.5).
 - No load-balancing distortions during long agentic sessions (Claude Code, computer use).
 
-**Is coding capability "dead weight" for non-coding queries?** No. In a dense model, every token routes through the same 200B parameters. Coding training does not add parameters — it shapes the existing ones. The same weights that compute "what's a quicksort partition step?" also compute "what's the capital of Norway?" — the model has learned a single representation space that handles both. This is exactly why dense models hit SWE-bench Verified ≥87% (modelcard 8.1) without sacrificing GPQA Diamond ≥94% on graduate-level science.
+**Is coding capability "dead weight" for non-coding queries?** No. In a dense model, every token routes through all ~427B parameters. Coding training does not add parameters — it shapes the existing ones. The same weights that compute "what's a quicksort partition step?" also compute "what's the capital of Norway?" — the model has learned a single representation space that handles both. This is exactly why dense models hit SWE-bench Verified ≥87% (modelcard 8.1) without sacrificing GPQA Diamond ≥94% on graduate-level science.
 
 By contrast, in MoE models, code tokens often route to a "code expert" while general-knowledge tokens route elsewhere — so an inference-time conversation that's mostly chat will under-utilize the code experts (and vice versa). Dense avoids that.
 
-The cost is GPU-hours per inference; that's why deployment minimums are 8× A100-80GB at int8 and 16× H100-80GB at bf16.
+The cost is GPU-hours per inference; that's why deployment minimums are 8× A100-80GB at int8 and 16× H100-80GB at bf16 (or 4× B200 at fp8 on Blackwell).
+
+### 1.2.1 Per-layer heterogeneity (not all layers are the same)
+
+Frontier-dense in 2026 is **not uniform across depth**. Two heterogeneities the code supports today via `ModelConfig.layer_overrides` (sparse per-layer dict, KV-cache-compatible):
+
+- **Per-layer `ffn_dim`** — taper FFN width across depth. Standard frontier convention is wider FFN at the network's edges (where representation-shaping load concentrates) and narrower in the middle (where layers refine representations and the marginal capacity gain is lower). This is the cleanest way to land a precise param target without changing `d_model` or `n_layers`.
+- **Per-layer `sliding_window`** — explicit override of the stride-based pattern. Pin specific layers to full attention (helps long-context retrieval evals MRCR / GraphWalks) or windowed attention (saves KV memory). Use `null` to force full attention; a positive int to set a custom window.
+
+Two presets ship in `src/sota_model/config.py`:
+
+```python
+from sota_model.config import (
+    ModelConfig,
+    tapered_ffn_overrides,
+    hybrid_attention_overrides,
+)
+
+cfg = ModelConfig(
+    layer_overrides={
+        # Wider FFN at the first/last 4 layers, narrower in the middle 102.
+        **tapered_ffn_overrides(110, edge_layers=4, middle_ffn_dim=49152),
+        # Force layer 0 and layer -1 to full attention regardless of stride.
+        **hybrid_attention_overrides(110, full_attention_layers=(0, -1)),
+    }
+)
+print(f"{cfg.estimate_params_billions():.1f} B")
+for row in cfg.per_layer_param_breakdown()[:3]:
+    print(row)
+```
+
+Per-layer `n_kv_heads` and `head_dim` are **NOT** supported by `layer_overrides` because the current paged KV cache assumes a uniform `(n_layers, n_kv_heads, head_dim)` shape; relaxing that needs a cache redesign and is left as a future op.
+
+**Param-count effect of tapering (worked example).** Starting from the YAML defaults (uniform, ~427B):
+
+| Override | Result | Δ from uniform |
+|---|---|---|
+| `tapered_ffn_overrides(110, edge_layers=4, middle_ffn_dim=49152)` (75% of edge) | ~345 B | −82 B |
+| `tapered_ffn_overrides(110, edge_layers=4, middle_ffn_dim=32768)` (50% of edge) | ~263 B | −164 B |
+| `tapered_ffn_overrides(110, edge_layers=4, middle_ffn_dim=24576)` (37.5%) | ~222 B | −205 B |
+| `hybrid_attention_overrides(110, (0, -1))` (structural; no param change) | ~427 B | 0 |
+
+Tapering alone can land any param count between ~427B (uniform) and ~150B (very aggressive). Below ~200B you typically also drop `d_model` or `n_layers` rather than continue narrowing FFN, because over-narrow FFN starts to bottleneck capacity at depth.
 
 ### 1.3 Attention: GQA + Flash Attention + sliding window
 
@@ -228,42 +299,49 @@ The legacy keyword stub is preserved as `safety.classifiers.default_safety_gate(
 
 ```python
 # Core
-torch >= 2.4                  # torch.compile, FlexAttention
-deepspeed >= 0.15             # ZeRO-3, gradient checkpointing
-flash-attn >= 3.0             # Hopper kernels
-transformers >= 4.45          # tokenizers, model utilities
+torch >= 2.6                       # torch.compile, FlexAttention, fp8 support
+deepspeed >= 0.15                  # ZeRO-3, gradient checkpointing
+flash-attn >= 3.0                  # Hopper / Blackwell kernels
+transformer-engine >= 1.13         # FP8 mixed-precision training (Blackwell native)
+transformers >= 4.45               # tokenizers, model utilities
 datasets >= 2.20
 tokenizers >= 0.20
 
 # Distributed / orchestration
 ray[default] >= 2.30
-megatron-lm                   # tensor + pipeline parallel
+megatron-lm                        # tensor + pipeline parallel
 accelerate
 
 # Observability
 wandb
 tensorboard
-nvidia-dcgm-exporter          # GPU telemetry
+nvidia-dcgm-exporter               # GPU telemetry
 ```
+
+The 2026 frontier-dense path uses **NVIDIA Transformer Engine** for FP8 mixed-precision training (E4M3 forward / E5M2 backward), with bf16 master weights. On Blackwell B200/B300 this delivers ~2× the throughput of bf16-on-Hopper at the same FLOP cost. The bf16 path remains supported as the fallback for Ampere/Hopper-only stacks — set `training.mixed_precision: bf16` in the YAML.
+
+Full reference for every precision format used here (fp32, bf16, fp16, fp8 E4M3/E5M2, int8, fp4 / MXFP4 / MXFP6 / MXFP8) plus a hardware-coverage matrix (Blackwell, Hopper, Ampere, Google TPU, ARM) and a "which precision should I pick?" flowchart: [`docs/PRECISION.md`](./docs/PRECISION.md).
 
 ### 2.2 Pretraining data: composition, size, and time
 
-**Total volume:** **15–20 trillion tokens** of pretraining corpus. At a global batch of 4M tokens/step, that's roughly **3.75M to 5M optimizer steps** before any post-training.
+**Total volume:** **20–40 trillion tokens** of pretraining corpus (default in `configs/sota_4_7.yaml::implied_training_corpus.total_tokens_trillions = 25`). At a global batch of 4M tokens/step, that's roughly **5M to 10M optimizer steps** before any post-training.
+
+This is the 2026 frontier-dense band. Reference points: DeepSeek-V3 trained on 14.8T (Dec 2024); Llama 4 trained on ~30T (early 2025). Chinchilla-optimal at 427B params is ~10T, but frontier-dense overtrains 5–8× because compute is cheaper than the marginal eval gain at the optimal point.
 
 Aligned with `` 1.1.1: "proprietary mix of publicly available internet information, public and private datasets, and synthetic data generated by other models."
 
-| Bucket | % of tokens | Approx tokens (at 18T total) | Sources |
+| Bucket | % of tokens | Approx tokens (at 25T total) | Sources |
 |---|---|---|---|
-| Web | 45% | ~8.1T | CommonCrawl filtered → RefinedWeb / FineWeb-Edu, deduplicated |
-| Code | 20% | ~3.6T | GitHub permissive, Stack v2, Stack Overflow, internal repos for SWE-bench-style tasks |
-| Academic | 10% | ~1.8T | arXiv, PubMed Central, Semantic Scholar |
-| Books / reference | 10% | ~1.8T | Project Gutenberg, Wikipedia, technical manuals |
-| Math, structured | 10% | ~1.8T | OpenWebMath, AlgebraicStack, scientific datasets, reasoning traces |
-| Dialogue / instructions | 5% | ~0.9T | Synthetic conversations, instruction datasets, tool-use traces |
+| Web | 45% | ~11.3T | CommonCrawl filtered → RefinedWeb / FineWeb-Edu, deduplicated |
+| Code | 20% | ~5.0T | GitHub permissive, Stack v2, Stack Overflow, internal repos for SWE-bench-style tasks |
+| Academic | 10% | ~2.5T | arXiv, PubMed Central, Semantic Scholar |
+| Books / reference | 10% | ~2.5T | Project Gutenberg, Wikipedia, technical manuals |
+| Math, structured | 10% | ~2.5T | OpenWebMath, AlgebraicStack, scientific datasets, reasoning traces |
+| Dialogue / instructions | 5% | ~1.3T | Synthetic conversations, instruction datasets, tool-use traces |
 
 **Wall-clock time (1024–2048 H100s):** ~**3–6 months** for full three-stage pretraining. Roughly 70% of compute in Stage 1 (foundation), 20% in Stage 2 (long context), 10% in Stage 3 (refinement). Post-training (SFT → RM → RLHF → Constitutional AI) adds another **~6–8 weeks**.
 
-**FLOPs budget:** ~10²⁵–10²⁶ training FLOPs. At 200B dense parameters and 18T tokens, the standard `6 × N × D` estimate gives `6 × 2×10¹¹ × 1.8×10¹³ ≈ 2.16×10²⁵` FLOPs — within the band.
+**FLOPs budget:** ~10²⁵–10²⁶ training FLOPs. At 427B dense parameters and 25T tokens, the standard `6 × N × D` estimate gives `6 × 4.27×10¹¹ × 2.5×10¹³ ≈ 6.4×10²⁵` FLOPs — in the band. FP8 mixed-precision on Blackwell delivers this at ~2× the throughput of bf16-on-Hopper.
 
 **Cost (compute alone, before salaries / data licensing):** **$10M–$50M** depending on the H100 hourly price and exact cluster utilization.
 
@@ -330,7 +408,7 @@ The flow from raw crawl to packed training shard:
                                         ▼
                      ┌──────────────────────────────────────┐
                      │  PARQUET SHARDS in object storage    │
-                     │  (~18T tokens after filtering)       │
+                     │  (~25T tokens after filtering)       │
                      └──────────────────┬───────────────────┘
                                         │
                                         ▼
@@ -397,7 +475,7 @@ training_config_stage1 = dict(
     seq_len=8_192,
     global_batch_tokens=4_194_304,     # 4M tokens
     grad_accum=16,
-    mixed_precision="bf16",
+    mixed_precision="fp8",            # 2026 frontier; "bf16" for Ampere/Hopper
     grad_checkpointing=True,
     zero_stage=3,
     tp_degree=8,                        # tensor parallel
@@ -480,7 +558,7 @@ Per `` framing of frontier-model R&D: **10²⁵–10²⁶ FLOPs**, **1000–2000
 
 ### 2.8 Parallelism — TP × PP × DP, all three at once
 
-Short answer: **all three.** A 200B dense model does not fit on any single GPU, so we stack tensor parallelism, pipeline parallelism, and data parallelism with ZeRO-3 sharding. Gradient accumulation is layered on top to reach the global batch.
+Short answer: **all three.** A ~427B dense model does not fit on any single GPU (~850 GB at bf16, ~430 GB at fp8), so we stack tensor parallelism, pipeline parallelism, and data parallelism with ZeRO-3 sharding. Gradient accumulation is layered on top to reach the global batch.
 
 | Axis | Degree | What gets split | Communication |
 |---|---|---|---|
@@ -519,7 +597,7 @@ Per-step token math at this layout:
 That's larger than the modelcard-aligned 4M default — operators tune the global batch by adjusting `dp_degree`, `grad_accum`, or per-replica micro-batch.
 
 **Why all three axes, not just one:**
-- **Pure DP** can't fit a 200B dense model on a single GPU's HBM (~400 GB at bf16).
+- **Pure DP** can't fit a 400B+ dense model on a single GPU's HBM (~850 GB at bf16, ~430 GB at fp8 — both exceed B200's 192 GB).
 - **Pure TP** is bandwidth-bound past ~8-way (the all-reduces on every layer become latency-dominant on slower interconnects).
 - **Pure PP** has bubble overhead unless the micro-batch count is high — and you can't grow the micro-batch indefinitely without OOM.
 - **TP × PP × DP** lets each axis solve a different bottleneck: TP for memory within node, PP for memory across nodes, DP for throughput.
@@ -612,7 +690,7 @@ The PPO trainer enforces this via `welfare_directive_guard`; offline transcript 
 
 ## 4. KV-Cache Handling and Inference Optimization
 
-The KV cache is the dominant memory cost at 1M-token context. A 200B-param dense model with **128 Q heads / 16 KV heads / d_head=128 / 110 layers** costs at bf16:
+The KV cache is the dominant memory cost at 1M-token context. A ~427B dense model with **128 Q heads / 16 KV heads / d_head=128 / 110 layers** costs at bf16:
 
 ```
 KV per token = 2 * n_kv_heads * head_dim * n_layers * 2 bytes
@@ -706,7 +784,7 @@ inference_defaults = dict(
     cache_implementation="paged",
     use_flash_attention=True,
     attention_dropout=0.0,
-    kv_cache_dtype="bf16",
+    kv_cache_dtype="fp8",             # 2026 default on Blackwell; "bf16" or "int8" otherwise
 )
 ```
 
@@ -735,10 +813,14 @@ Sign-off rests with a Responsible Scaling Officer–equivalent role.
 
 ### 5.2 Inference cluster topology
 
+For a ~427B dense model:
+
 ```
-Minimum (int8):       4 × A100 80GB
-Standard (bf16):      8 × A100 80GB
-Optimal (low latency): 16 × H100 80GB
+Minimum (fp4 / int4):      2 × B200 192GB    # 2026 entry point on Blackwell
+Memory-tight (int8):       4 × A100 80GB     # Ampere fallback
+Standard (fp8):            4 × B200 192GB    # Blackwell native
+Standard (bf16):           8 × A100 80GB     # Hopper / Ampere
+Optimal (low latency):     8 × B200 192GB or 16 × H100 80GB
 
 Sharding
     Tensor parallel:   8     # within node, NVLink

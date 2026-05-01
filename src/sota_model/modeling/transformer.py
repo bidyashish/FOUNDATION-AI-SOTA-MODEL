@@ -32,6 +32,14 @@ class ModelOutput:
 
 
 class SOTATransformerBlock(nn.Module):
+    """One transformer block.
+
+    Reads its effective shape from `cfg.layer_config(layer_idx)` so per-layer
+    `ffn_dim` and `sliding_window` overrides flow through automatically.
+    Frontier-dense models are not uniform across depth — see
+    `ModelConfig.layer_overrides` and presets like `tapered_ffn_overrides`.
+    """
+
     def __init__(
         self,
         cfg: ModelConfig,
@@ -39,23 +47,20 @@ class SOTATransformerBlock(nn.Module):
         layer_idx: int,
     ):
         super().__init__()
-        sw = (
-            cfg.sliding_window_size
-            if (layer_idx % cfg.sliding_window_layer_stride == 0 and layer_idx > 0)
-            else None
-        )
+        lc = cfg.layer_config(layer_idx)
+        self.layer_idx = layer_idx
         self.input_norm = RMSNorm(cfg.d_model, eps=cfg.norm_eps)
         self.attn = GroupedQueryAttention(
             d_model=cfg.d_model,
-            n_q_heads=cfg.n_q_heads,
-            n_kv_heads=cfg.n_kv_heads,
-            head_dim=cfg.head_dim,
+            n_q_heads=lc.n_q_heads,
+            n_kv_heads=lc.n_kv_heads,
+            head_dim=lc.head_dim,
             rope=rope,
-            sliding_window=sw,
+            sliding_window=lc.sliding_window,
             layer_idx=layer_idx,
         )
         self.post_attn_norm = RMSNorm(cfg.d_model, eps=cfg.norm_eps)
-        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_dim)
+        self.ffn = SwiGLU(cfg.d_model, lc.ffn_dim)
 
     def forward(
         self,
