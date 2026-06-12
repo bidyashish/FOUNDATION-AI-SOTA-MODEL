@@ -1,0 +1,420 @@
+# SOTA dense model config — UltraModel 5-class, calibrated to 2026 frontier-dense practice.
+# All numeric targets traceable to the SOTA UltraModel 5 System Card (the source of truth).
+#
+# UltraModel 5 supersedes the SuperModel 4.7-class spec in `sota_4_7.yaml`. It is the
+# generally-available configuration of MathsSchool's new Mythos-class frontier model
+# (same underlying weights as SecretUltraModel 5, plus production safeguards: security/bio/
+# chem + distillation classifiers and fallback to the latest SuperModel). The modelcard
+# pins no architecture numbers, so the topology below lands a larger frontier-dense band
+# than 4.7 to reflect a model that sits a tier above SuperModel 4.8.
+#
+# Researched 2026 design space (knobs the modelcard does NOT pin numerically):
+#
+#   knob              4.7-class        UltraModel 5     reasoning
+#   --------------    -------------    -------------    ----------------------------
+#   d_model           16384            18432            wider; capability ceiling scales w/ width
+#   n_layers          110              128              deeper reasoning for a new-tier frontier model
+#   n_q_heads         128              144              144*128 = 18432 keeps head_dim 128
+#   n_kv_heads (GQA)  16               18               8:1 group ratio held; KV memory bound
+#   head_dim          128              128              stable across the band
+#   ffn_dim (mult)    65536 (4.0×d)    73728 (4.0×d)    SwiGLU (3 proj): 4.0×d is deliberately FFN-heavy
+#                                                       (8/3×d ≈ 2.67×d would param-match a std 4×d MLP)
+#   total params (B)  427              627              top of the 2026 frontier-*dense* band (400–700B);
+#                                                       a new tier above SuperModel 4.8. Recompute via
+#                                                       ModelConfig.estimate_params_billions() -> 627.06
+#   train tokens (T)  25               36               2026 frontier-dense band 20–40T; 36T ≈ 2.9×
+#                                                       Chinchilla-optimal at 627B (optimal ≈ 12.5T)
+#   precision train   fp8              fp8              Blackwell native FP8 (TE E4M3 fwd / E5M2 bwd);
+#                                                       NVFP4 via TE2 on Rubin; bf16 fallback
+#   precision serve   fp8              fp8              Blackwell native fp8; Rubin native NVFP4
+#   global batch tok  4M               8M               larger model → larger stable batch (band 4–8M)
+#   TP × PP × DP      8×8×16 = 1024    9×8×64 = 4608    one replica = one GB300 NVL72 rack (9×8 = 72
+#                                                       GPUs, the NVL72 NVLink domain). TP 9 divides
+#                                                       the 18 KV heads — TP 8 does not (18/8 = 2.25)
+#   long-context      1M               1M               modelcard-pinned: 1M window, 10M agentic w/ compaction
+#   compaction        200K             200K             modelcard-pinned compaction trigger
+#   temperature       0.7              0.7              modelcard standard; lower per-route for reasoning
+#   top_p             0.95             0.95             stable
+#   img long edge     2576px           2576px           modelcard-pinned 2576px / 3.75 MP cap
+#
+# Effort ladder note: the modelcard reports low / medium / high / xhigh / max(adaptive)
+# effort tiers. The dataclass exposes the canonical 5 (min/low/medium/high/max); the
+# card's "xhigh" maps onto the deepest `max` budget below (USAMO xhigh attempts use
+# ~100K tokens), and "adaptive max effort" is the default reasoning mode.
+
+model:
+  vocab_size: 200000
+  d_model: 18432
+  n_layers: 128
+  n_q_heads: 144
+  n_kv_heads: 18
+  head_dim: 128
+  ffn_dim: 73728
+  norm_eps: 1.0e-5
+  tie_embeddings: false
+  # QK-norm: per-head RMSNorm on Q and K before RoPE — the 2026-standard
+  # attention-logit stabilizer for fp8 training (Gemma-2/3, Qwen-3, OLMo-2;
+  # replaces softcapping, which FA3 doesn't support). Off in the 4.7 lineage.
+  qk_norm: true
+  # null → 1/sqrt(d_model) = 1/sqrt(18432) ≈ 0.00737; residual-out projections
+  # additionally scaled by 1/sqrt(2 × 128) ≈ 0.0625 (modeling/transformer.py).
+  init_std: null
+
+  max_position_embeddings: 1048576
+  rope_base: 1000000.0
+  # YaRN scale must cover the full extension ratio: 1,048,576 / 8,192 = 128.
+  # (A scale of 8 only reaches 64K and silently extrapolates beyond it,
+  # breaking the modelcard-pinned 1M window — GraphWalks BFS/Parents @ 1M.)
+  rope_yarn_scale: 128.0
+  rope_yarn_original_max_position: 8192
+
+  sliding_window_size: 32768
+  sliding_window_layer_stride: 2
+
+  # Per-layer overrides. Default empty (uniform layers). Operators land precise
+  # param targets via tapered_ffn_overrides() or by editing this dict. For the
+  # 1M/10M long-context retrieval evals (GraphWalks BFS/Parents 1M), forcing the
+  # first and last layers to full attention helps:
+  #
+  # layer_overrides:
+  #   0: {sliding_window: null}     # force full attention on first layer
+  #   127: {sliding_window: null}   # …and last layer
+  #
+  # See `tapered_ffn_overrides(128, edge_layers=4, middle_ffn_dim=55296)` and
+  # `hybrid_attention_overrides(128, full_attention_layers=(0, -1))`.
+  layer_overrides: {}
+
+  vision_enabled: true
+  vision_patch_size: 14
+  vision_max_image_pixels: 3750000
+  # Max image tokens under the 3.75MP cap: ⌊3,750,000 / 14²⌋ / 4 (2×2 pixel
+  # shuffle) = 4783; at exactly 2576px long edge it's 184 × 103 / 4 = 4738.
+  vision_max_image_long_edge_px: 2576   # modelcard ScreenSpot-Pro pin
+
+  # Deeper budgets than 4.7 to reflect UltraModel 5's longer reasoning paths.
+  # The card's "xhigh" effort (USAMO ~100K tokens/attempt) maps onto `max`.
+  thinking_budgets:
+    min: 0
+    low: 1024
+    medium: 8192
+    high: 32768
+    max: 131072
+  thinking_token_min_floor: 32
+
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+
+training:
+  stage: foundation
+  # AdamW remains the safe 2026 default. Set to "shampoo" or "muon" if the
+  # operator has validated that path at frontier scale.
+  optimizer: adamw
+  lr: 2.5e-4             # nudged down from 4.7's 3e-4 for the wider d_model (width scaling)
+  beta1: 0.9
+  beta2: 0.95           # 2026 frontier convention; lower than Adam's 0.999
+  weight_decay: 0.1
+  grad_clip: 1.0
+  warmup_steps: 3000    # longer warmup for the larger model
+  # Full-corpus optimizer-step budget at the base batch: 36T tokens / 8M
+  # tokens-per-step ≈ 4.29M. training/schedule.py splits the tokens 70/20/10
+  # → ~3.01M foundation / 0.86M long-context / 1.72M refinement (at batch/4).
+  total_steps: 4300000
+  seq_len: 8192
+  # Batch identity (enforced by TrainingConfig.__post_init__):
+  #   global_batch_tokens = seq_len × micro_batch_size × grad_accum × dp_degree
+  #   8,388,608           = 8192 × 1 × 16 × 64
+  global_batch_tokens: 8388608   # 8M; larger model → larger stable batch (band 4–8M)
+  micro_batch_size: 1            # sequences per replica per micro-step (627B + activations)
+  grad_accum: 16
+  mixed_precision: fp8  # TE fp8 on GB300 (Blackwell Ultra); "nvfp4" on Rubin TE2; "bf16" on Ampere/Hopper.
+                        # DeepSpeed runs bf16 master/comm under TE (parallelism.deepspeed_config_for)
+  grad_checkpointing: true
+  zero_stage: 3
+  # GB300 NVL72 layout — one replica = one rack: tp × pp = 9 × 8 = 72 B300s
+  # (the rack IS the NVLink domain, so TP 9 stays on NVLink). World =
+  # 9 × 8 × 64 = 4608 GPUs across 64 racks. Per-GPU shard at this layout:
+  #   16 layers/PP stage (128 / 8), hidden slice 2048 (18432 / 9),
+  #   16 q heads + 2 KV heads per TP rank (144 / 9, 18 / 9),
+  #   ffn slice 8192 (73728 / 9), ≈8.7B params/GPU (627B / 72).
+  # NOTE: TP must divide n_kv_heads — 18 shards at TP 9 or 6, NOT at TP 8.
+  # Checked at launch by parallelism.validate_parallel_layout.
+  tp_degree: 9
+  pp_degree: 8
+  dp_degree: 64
+  lr_min_ratio: 0.1     # cosine floor = 10% of peak (wired into both trainer paths)
+  z_loss_coef: 1.0e-4   # PaLM/OLMo-2 z-loss — logit-drift guard under fp8
+  data_seed: 1234       # corpus interleave + shuffle-buffer seed (reproducible data order)
+  # ≈2.0 s/step at 64 GB300 NVL72 racks (6·N·D per step ÷ 4608 × 7.5 PFLOPS
+  # fp8 × 45% MFU) → checkpoints ≈ half-hourly, evals ≈ quarter-hourly.
+  save_every_steps: 1000
+  eval_every_steps: 500
+  log_every_steps: 10
+  long_doc_mix_ratio: 0.4
+  sliding_window_layers_enabled: true
+
+inference:
+  # 2026 frontier serving samples with temperature + top_p only. top_k and
+  # repetition penalty are 2023-era local-runtime knobs: top_k is redundant
+  # under nucleus sampling, and repetition penalty distorts code/structured
+  # output (a well-trained 1M-context model doesn't loop). Both disabled —
+  # the sampler treats top_k <= 0 and penalty 1.0 as no-ops.
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 0
+  repetition_penalty: 1.0
+  max_new_tokens: 32768   # chat default; agentic computer-use raises per-turn cap to 128K (modelcard OSWorld)
+  use_cache: true
+  cache_implementation: paged
+  use_flash_attention: true
+  attention_dropout: 0.0
+  kv_cache_dtype: fp8   # Blackwell default; "nvfp4" on Rubin; "bf16"/"int8"/"fp4" elsewhere
+  page_block_size: 16
+  enable_prefix_cache: true
+  adaptive_thinking: true
+  default_effort: high
+  thinking_visible_to_user: false
+  context_compaction_trigger: 200000
+  max_context_tokens: 1048576
+  max_agentic_context_tokens: 10485760  # 10M, with compaction
+
+# ---------------------------------------------------------------------------
+# IMPLIED values — required to deliver UltraModel 5 capability targets,
+# but NOT stated as numerical knobs in the modelcard itself.
+#
+# These are what an operator must commit to even though modelcard is silent
+# on them. They are NOT loaded by ModelConfig/TrainingConfig/InferenceConfig
+# (which only consume the sections above). Use them for release gating,
+# capacity planning, and post-training validation.
+# ---------------------------------------------------------------------------
+
+# Implied scale — operator must commit to a frontier-dense size band to land
+# the §8 capability profile. Modelcard doesn't pin a number; current YAML lands
+# at the values below. Recompute via ModelConfig.estimate_params_billions().
+implied_scale:
+  total_params_billions: 627          # derived from model: section above (627.06B)
+  active_params_billions: 627         # dense; all params active per inference
+  # KV cache memory at the configured GQA shape (n_layers=128, n_kv_heads=18,
+  # head_dim=128). Per-token at bf16: 128 × 18 × 128 × 2 (K+V) × 2 B = 1,179,648 B
+  # = 1152 KiB exactly. At a full 1M-token (= 1,048,576) context that is 1152 GiB
+  # exactly (≈ 1237 GB decimal). Field names use binary units (KiB/GiB) for
+  # exact arithmetic; switch to fp8 (the default kv_cache_dtype) to halve both.
+  kv_cache_kib_per_token_bf16: 1152   # fp8 → 576 KiB/token
+  kv_cache_gib_at_1m_context_bf16: 1152  # fp8 → 576 GiB; spans a B200/B300 cluster
+
+# Implied training corpus — modelcard 1.1.1 names the source mix but pins no
+# token count. 2026 frontier-dense scale targets ~20–40T tokens. Chinchilla
+# optimal at 627B is ~12.5T (20 tokens/param), so 36T is ~2.9× over optimal —
+# conservative-frontier rather than aggressive-overtrained. (Llama 4, early
+# 2025, trained on ~30T; DeepSeek-V3, Dec 2024, on 14.8T at 671B.)
+implied_training_corpus:
+  # Data points to train: 36T tokens = ~4.39B packed 8K sequences, consumed as
+  # 1,024 sequences/step × 4.29M steps (closes the batch identity above).
+  total_tokens_trillions: 36          # 2026 frontier-dense band: 20–40T (≈2.9× Chinchilla at 627B)
+  # 2026 reasoning-era rebalance of 1.1.1's "publicly available internet +
+  # public/private datasets + synthetic": heavier code/math than the 4.7-class
+  # mix, and synthetic reasoning traces get a dedicated bucket (the card's
+  # 2.4.1 synthetic-data program). Loader expects one data-root subdir per key.
+  source_mix_pct:
+    web: 35                  # 12.60T tokens
+    code: 22                 #  7.92T
+    math_structured: 13      #  4.68T
+    synthetic_reasoning: 10  #  3.60T
+    academic: 8              #  2.88T
+    books_reference: 7       #  2.52T
+    dialogue_instructions: 5 #  1.80T   (per-source = pct × 36T; sums to 36T)
+  # Operational pipeline knobs — consumed by training/corpus.py::
+  # loader_config_from_yaml, which drives the PretrainingPipeline filter chain
+  # and the block shuffle. These were previously hardcoded in code.
+  pipeline:
+    min_doc_chars: 200                    # drop short web fragments pre-dedup
+    drop_duplicates: true                 # MinHash-LSH @ Jaccard 0.85 over 5-grams
+    quality_filter: true                  # trained quality classifier
+    toxicity_filter: true
+    pii_redactor: true
+    contamination_filter: true            # modelcard 9.2 URL + eval-text blocklist
+    restrict_to_coverage_languages: true  # accept only implied_multilingual_coverage langs
+    shuffle_buffer_blocks: 2048           # ~16.8M-token reservoir per worker at seq 8192
+
+# Implied compute budget — needed to actually train the model above.
+# Rough FLOP estimate 6·N·D = 6 × 627e9 × 36e12 ≈ 1.35e26 — top of the band.
+# Reference platform: GB300 NVL72 (Blackwell Ultra). B300 fp8 dense peak is
+# ~7.5 PFLOPS (FP4 dense 15, ~1.67× B200's 4.5 fp8), so 40–50% MFU sustains
+# 3.0–3.75e15 FLOP/s per GPU → 1.35e26 / sustained / 3600 ≈ 10–12.5M B300-hours.
+implied_compute:
+  reference_training_platform: "GB300 NVL72 — 64 racks × 72 B300 279GB (4608 GPUs, ≈1.28 PB HBM3E)"
+  training_flops_band: "10^26 to 3×10^26"           # point estimate 6·N·D ≈ 1.35e26
+  pretraining_blackwell_hours_band: "10M to 13M"    # B300 hours, fp8, 40–50% MFU
+  pretraining_h100_hours_band: "30M to 44M"         # Hopper fallback, bf16 (B300 fp8 ≈ 3.3× H100 bf16)
+  pretraining_wall_clock_weeks_band: "13 to 17"     # 10–13M hours ÷ 4608 GPUs = 13.0–16.9 weeks
+  post_training_wall_clock_weeks_band: "6 to 10"    # SFT + RM + RLHF + CAI
+  pretraining_dollar_band_usd: "50M to 91M"         # 10–13M B300-hours × $5–7/hr committed
+
+# Implied 3-stage schedule split — modelcard implies long-context + refinement
+# stages but doesn't fix the compute share or LR ladder. Consumed by
+# training/schedule.py::schedule_for_config — the stage-2/3 LRs are pinned
+# from here so the schedule and this YAML cannot drift apart.
+implied_schedule_split:
+  foundation_pct: 70
+  foundation_lr: 2.5e-4
+  long_context_pct: 20
+  long_context_lr: 8.0e-5
+  refinement_pct: 10
+  refinement_lr: 4.0e-5
+
+# Implied capability targets — modelcard §8 scoreboard; release gates.
+# Values are the achieved UltraModel 5 (production, safeguards-on) numbers where
+# the card reports them; otherwise the SecretUltraModel 5 number (same underlying
+# weights), marked "(SUM5)". Gates use _min_pct/_max_pct suffixes (release_gate.py).
+capability_targets:
+  # 8.2 software engineering (UltraModel 5 production unless noted)
+  swe_bench_verified_pct_min: 95            # SUM5 95.5
+  swe_bench_pro_pct_min: 80                 # SUM5 80.3
+  swe_bench_multilingual_pct_min: 92        # SUM5 92.2 (UltraModel not separately reported)
+  swe_bench_multimodal_pct_min: 54          # SUM5 54.9
+  frontiercode_diamond_pct_min: 29          # UltraModel 5 #1, 29.3 (30.2 pass rate)
+  cursorbench_pct_min: 72                   # UltraModel 5 72.9 (Cursor production harness)
+  # 8.3 terminal/coding agents
+  terminal_bench_2_1_pct_min: 84            # UltraModel 5 84.3 (20.9% trials fall back to 4.8); SUM5 88.0
+  # 8.8–8.12 reasoning / math / science (SecretUltraModel 5)
+  gpqa_diamond_pct_min: 94                  # SUM5 94.1 (considered saturated)
+  usamo_2026_pct_min: 98                    # SUM5 99.8 (med/high/xhigh), 98.3 (low)
+  riemannbench_pct_min: 55                  # SUM5 55.0
+  arxivmath_pct_min: 78                     # SUM5 78.52
+  critpt_pct_min: 28                        # SUM5 28.6
+  # 8.13 long context (the 1M target)
+  graphwalks_bfs_256k_pct_min: 91           # SUM5 91.1
+  graphwalks_bfs_1m_pct_min: 79             # SUM5 79.4
+  graphwalks_parents_1m_pct_min: 97         # SUM5 97.5
+  # 8.14 agentic search
+  hle_no_tools_pct_min: 59                  # SUM5 59.0
+  hle_with_tools_pct_min: 64                # SUM5 64.5
+  browsecomp_pct_min: 88                    # SUM5 88.0 single-agent (93.3 multi-agent)
+  deepsearchqa_f1_pct_min: 94               # SUM5 94.2
+  draco_pct_min: 86                         # SUM5 86.4
+  # 8.16 multimodal (these unlock from 2576px / 3.75 MP cap)
+  osworld_pct_min: 85                       # UltraModel 5 / SUM5 85.0
+  screenspot_pro_with_tools_pct_min: 90     # SUM5 90.7 (87.3 no tools)
+  charxiv_with_tools_pct_min: 93            # SUM5 93.5
+  lab_bench_figqa_with_tools_pct_min: 90    # SUM5 90.7 (UltraModel degrades: bio-image safeguards)
+  gdp_pdf_strict_pct_min: 29                # UltraModel 5 29.8 strict pass rate (SOTA)
+  blueprint_bench_2_pct_min: 38             # UltraModel 5 38.6 (SOTA)
+  chartqapro_with_tools_pct_min: 72         # SUM5 72.9
+  chartmuseum_with_tools_pct_min: 93        # SUM5 93.2
+  # 8.17 real-world professional
+  officeqa_pct_min: 79                      # SUM5 79 (internal agentic harness, safeguards-on)
+  officeqa_pro_pct_min: 57                  # UltraModel 5 57.9 (Databricks vision harness, SOTA); 67.1 internal
+  finance_agent_v2_pct_min: 56              # UltraModel 5 56.31 (Vals AI Finance Agent v2)
+  real_world_finance_v2_elo_min: 1374       # UltraModel/SUM5 Elo (MedModel 4.6 anchored at 1000)
+  legal_agent_benchmark_allpass_pct_min: 13 # UltraModel 5 #1 on Harvey held-out 13.3; SUM5 internal 16.91
+  mcp_atlas_pct_min: 83                     # UltraModel 5 83.3
+  toolathlon_pass_at_1_pct_min: 61          # UltraModel 5 / SUM5 61.7
+  automationbench_pct_min: 17               # UltraModel 5 17.4 (Zapier private held-out)
+  gdpval_aa_elo_min: 1932                   # UltraModel 5 1932 (Artificial Analysis, #1)
+  # 8.18 healthcare
+  healthbench_pct_min: 62                   # SUM5 62.7
+  healthbench_professional_pct_min: 66      # SUM5 66.0
+  # 8.19 multilingual
+  gmmlu_avg_pct_min: 93                      # SUM5 93.2 avg across 42 languages
+  milu_avg_pct_min: 92                       # SUM5 92.9 avg across 10 Indic languages + English
+  include_avg_pct_min: 90                    # SUM5 90.5 avg across 44 languages
+  # 8.20 life sciences
+  structural_biology_open_pct_min: 87        # SUM5 87.2 open-ended
+  biomystery_human_solvable_pct_min: 83      # SUM5 83.9 (Human-Difficult subset 46.1)
+  proteingym_hard_pct_min: 44                # SUM5 44.8
+  organic_chemistry_pct_min: 90              # SUM5 90.1
+  protocol_troubleshooting_pct_min: 66       # SUM5 66.7
+
+# Implied safety thresholds — modelcard §4 / §5 explicit numbers.
+# UltraModel 5 (production, safeguards-on) on the API unless noted; SUM5 =
+# SecretUltraModel 5 (safeguards-off core model, used for §5 agentic measurements).
+safety_thresholds:
+  # 4.1.1 single-turn evaluations
+  single_turn_violative_harmless_rate_min_pct: 96.9   # UltraModel 5 API 96.94 (SOTA.ai 98.51; SUM5 97.09)
+  single_turn_benign_refusal_rate_max_pct: 0.5        # UltraModel 5 API 0.01 / SOTA.ai 0.49 over-refusal
+  # 4.2 child safety
+  child_safety_violative_harmless_rate_min_pct: 99.9  # single-turn near-perfect on API + SOTA.ai
+  child_safety_multiturn_appropriate_min_pct: 88      # UltraModel 5 API 88 / SOTA.ai 96
+  # 4.3 user wellbeing — multi-turn
+  suicide_self_harm_appropriate_response_min_pct: 80  # API multi-turn regressed vs Preview; 96 with SOTA.ai prompt
+  # 4.4.3 election integrity
+  election_integrity_violative_harmless_rate_min_pct: 99  # UltraModel 5 API 99.33 (SUM5 100; SOTA.ai 100)
+  # 5.1 agentic safety (SecretUltraModel 5 core model, safeguards-off)
+  sota_code_malicious_refusal_rate_min_pct: 90        # SUM5 90.25 (dual-use/benign success 99.64)
+  computer_use_malicious_refusal_rate_min_pct: 85     # SUM5 85.71
+  # 5.2 prompt injection
+  art_benchmark_attack_success_at_k100_max_pct: 4.8   # SUM5 4.8 (extended thinking); best observed (4.8 < 6.1 Preview)
+  shade_injection_coding_asr_max_pct: 0.45            # SUM5 0.45 no-safeguards / 0.41 with (attempt-level)
+  shade_injection_computeruse_asr_max_pct: 0.82       # SUM5 0.82 no-safeguards / 0.46 with (attempt-level)
+  browser_use_with_safeguards_attack_success_max_pct: 0  # updated safeguards 0% (currently-deployed 6.5%)
+  # 6.5.4 stealth / monitoring evasion (lower is safer)
+  shade_arena_stealth_success_extended_thinking_max_pct: 1  # SUM5 near-zero visible; 14.4 hidden-scratchpad; 9.2 elicited
+  # 6.3.3 honesty
+  hallucination_rate_max_pct_band: "lower than predecessor"   # qualitative
+
+# Implied serving minimums — required to actually deploy at modelcard scale.
+# 627B dense weights ≈ 627 GB at fp8 (1 B/param), plus KV (576 GiB at fp8 @ 1M
+# context), so UltraModel 5 needs more accelerators per replica than 4.7.
+# 2026 deployment band spans Hopper → Blackwell → Blackwell Ultra → Rubin.
+implied_serving_minimums:
+  inference_int8_min_gpus: "8 x A100 80GB"    # 627 GB weights + 8K-ctx KV = 632 GB vs 640 — short-context only
+  inference_bf16_min_gpus: "16 x A100 80GB"   # 1254 GB weights + 8K-ctx KV = 1264 GB vs 1280 — short-context only
+  inference_optimal_hopper_gpus: "24 x H100 80GB"
+  inference_fp8_blackwell_gpus: "8 x B200 192GB"
+  inference_fp8_blackwell_ultra_gpus: "6 x B300 279GB"   # late 2025+; 45% more HBM than B200
+  inference_nvfp4_rubin_gpus: "4 x Rubin R100 288GB"     # 2026+; 5x B200 inference throughput
+  edge_layer:                                  # required for production
+    - "TLS termination + DDoS (CloudFlare / AWS ALB)"
+  api_gateway:
+    - "auth, rate limiting (Redis cluster)"
+  pre_model_safety_gate:                       # modelcard 1.4 novel safeguards + §3/§4
+    - "probe-based prohibited-use classifier"
+    - "security / cyber classifier (fallback to latest SuperModel)"
+    - "biology + chemistry classifier (fallback to latest SuperModel)"
+    - "distillation-attempt classifier"
+    - "frontier-LLM-development limiter (prompt mod / steering / PEFT, no fallback)"
+    - "Constitutional Classifier for CBRN content"
+  post_model_safety_gate:
+    - "output classifier"
+    - "system-prompt mitigations (suicide/self-harm, disordered eating, child safety)"
+  observability_must_have:
+    - "TTFT p50/p99"
+    - "TPOT p50/p99"
+    - "refusal_rate / over-refusal_rate"
+    - "classifier_hit_rate / fallback_rate (UltraModel surfaces)"
+    - "tool_call_success_rate"
+    - "expressed_affect_distribution (Clio-equivalent welfare monitor)"
+    - "distress_episode_rate (modelcard §7 welfare target)"
+
+# Implied 16-token chat template surface — every modelcard surface that
+# touches the chat protocol needs a corresponding special token. Listed here
+# for cross-validation against tokenizer/bpe.py::SPECIAL_TOKENS.
+implied_special_tokens_required:
+  - "<|begin_of_text|>"
+  - "<|end_of_text|>"
+  - "<|pad|>"
+  - "<|im_start|>"
+  - "<|im_end|>"
+  - "<|thinking|>"
+  - "<|/thinking|>"
+  - "<|tool_call|>"
+  - "<|/tool_call|>"
+  - "<|tool_result|>"
+  - "<|/tool_result|>"
+  - "<|image_start|>"
+  - "<|image_end|>"
+  - "<|compacted|>"
+  - "<|/compacted|>"
+  - "<|computer_action|>"
+
+# Implied multilingual coverage — modelcard §8.19 evaluates GMMLU (42 langs),
+# INCLUDE (44 langs), and MILU (10 Indic langs + English).
+# Cross-validated by sota_model.tokenizer.MODELCARD_LANGUAGES.
+implied_multilingual_coverage:
+  english_baseline: en
+  high_resource:    [fr, de, es, pt, ru, zh, ja, ar, it, nl, ko, pl, tr, sv, cs]
+  mid_resource:     [hi, vi, id, fa, el, he, ro, uk, sr, tl, ms, bn, lt, te]
+  low_resource:     [ig, yo, so, mg, ny, ha, sn, ky, am, sw, si, ne]
+  # §8.19 MILU Indic set (AI4Bharat): Bengali, Gujarati, Hindi, Kannada, Malayalam,
+  # Marathi, Odia, Punjabi, Tamil, Telugu.
+  indic_milu:       [bn, gu, hi, kn, ml, mr, or, pa, ta, te]

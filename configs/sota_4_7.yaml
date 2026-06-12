@@ -1,0 +1,324 @@
+# SOTA dense model config — SuperModel 4.7-class, calibrated to 2026 frontier-dense practice.
+# All numeric targets traceable to  (the source of truth).
+#
+# Researched 2026 design space (knobs the modelcard does NOT pin numerically):
+#
+#   knob              2024 typical     2026 frontier     here     reasoning
+#   --------------    -------------    --------------    ------   ----------------------------
+#   d_model           12 288–16 384    14 336–20 480     16384    capability ceiling scales w/ width
+#   n_layers          80–126           100–180           110      depth helps reasoning; cost is wall-clock
+#   n_q_heads         64–128           96–160            128      scales with d_model; head_dim 128 stable
+#   n_kv_heads (GQA)  8–16             8–16  (or MLA)    16       8:1 group ratio; KV memory bound
+#   head_dim          128              128               128      stable across the band
+#   ffn_dim (mult)    3.0–4.0×d        3.5–4.0×d         4.0×d    SwiGLU effective ~2.7×d at 4×; tapering
+#                                                                  per-layer is the modern way to land precise
+#                                                                  param counts (see layer_overrides below)
+#   total params (B)  100–500 dense    400–700 dense     427      DeepSeek-V3 671B MoE / Llama 4 ~2T MoE
+#                                                                  → frontier *dense* sits at 400–700B
+#   train tokens (T)  10–18            20–40             25       ~3× Chinchilla-optimal (band 20–40T = 2.3–4.7×)
+#   precision train   bf16             FP8 mixed (TE)    fp8      DeepSeek-V3 + Llama 4 shipped FP8 native
+#                                                                  in 2024–2025; bf16 is now the fallback;
+#                                                                  Rubin (2026+) lifts to NVFP4 via TE2 for
+#                                                                  3.5x training throughput
+#   precision serve   bf16/int8        fp8/int8/fp4      fp8      Blackwell native fp8; Rubin native NVFP4
+#                                                                  (5x B200 inference throughput)
+#   optimizer         AdamW            AdamW (β2=0.95)   adamw    Distributed Shampoo emerging at Google;
+#                                                                  Muon (Jordan 2024) gaining; not yet
+#                                                                  validated at 400B+ publicly
+#   global batch tok  2–8 M            4–8 M             4M       4M token batches are stable with ZeRO-3
+#   long-context      128K–1M          1M (10M agentic)  1M       compaction at 200K → 10M effective
+#   temperature       0.6–0.7          0.6–0.7           0.7      lower for reasoning paths; tune per route
+#   top_p             0.9–0.95         0.9–0.95          0.95     stable
+#   img long edge     1568 px (1 MP)   2576 px (3.75 MP) 2576px   modelcard invariant 6
+#
+# Updates in this revision:
+#   - mixed_precision: bf16 → fp8 (TE-style E4M3 forward / E5M2 backward)
+#   - kv_cache_dtype: bf16 → fp8 (Blackwell default; falls back to bf16/int8)
+#   - implied_training_corpus.total_tokens_trillions: 18 → 25
+#   - implied_compute.training_flops_band: same band, but FP8 is 2× faster wall-clock on Blackwell
+#   - layer_overrides: now expressible per-layer (frontier dense ≠ uniform)
+
+model:
+  vocab_size: 200000
+  d_model: 16384
+  n_layers: 110
+  n_q_heads: 128
+  n_kv_heads: 16
+  head_dim: 128
+  ffn_dim: 65536
+  norm_eps: 1.0e-5
+  tie_embeddings: false
+
+  max_position_embeddings: 1048576
+  rope_base: 1000000.0
+  # YaRN scale must cover the full extension ratio: 1,048,576 / 8,192 = 128.
+  rope_yarn_scale: 128.0
+  rope_yarn_original_max_position: 8192
+
+  sliding_window_size: 32768
+  sliding_window_layer_stride: 2
+
+  # Per-layer overrides. Default empty (uniform layers). Operators land precise
+  # param targets via tapered_ffn_overrides() or by editing this dict. Example:
+  #
+  # layer_overrides:
+  #   0: {sliding_window: null}     # force full attention on first layer
+  #   109: {sliding_window: null}   # …and last layer (helps long-context retrieval)
+  #   4: {ffn_dim: 49152}           # narrower FFN in the middle band
+  #   ...
+  #
+  # See `tapered_ffn_overrides(110, edge_layers=4, middle_ffn_dim=49152)` and
+  # `hybrid_attention_overrides(110, full_attention_layers=(0, -1))`.
+  layer_overrides: {}
+
+  vision_enabled: true
+  vision_patch_size: 14
+  vision_max_image_pixels: 3750000
+  vision_max_image_long_edge_px: 2576
+
+  thinking_budgets:
+    min: 0
+    low: 256
+    medium: 2048
+    high: 8192
+    max: 32768
+  thinking_token_min_floor: 32
+
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+
+training:
+  stage: foundation
+  # AdamW remains the safe 2026 default. Set to "shampoo" or "muon" if the
+  # operator has validated that path at frontier scale.
+  optimizer: adamw
+  lr: 3.0e-4
+  beta1: 0.9
+  beta2: 0.95           # 2026 frontier convention; lower than Adam's 0.999
+  weight_decay: 0.1
+  grad_clip: 1.0
+  warmup_steps: 2000
+  # Full-corpus optimizer-step budget at the base batch: 25T tokens / 4M
+  # tokens-per-step ≈ 6M (README 2.2: "5M to 10M optimizer steps").
+  # training/schedule.py splits the tokens 70/20/10 across the three stages.
+  total_steps: 6000000
+  seq_len: 8192
+  # Batch identity (enforced by TrainingConfig.__post_init__):
+  #   global_batch_tokens = seq_len × micro_batch_size × grad_accum × dp_degree
+  #   4,194,304           = 8192 × 2 × 16 × 16
+  global_batch_tokens: 4194304
+  micro_batch_size: 2
+  grad_accum: 16
+  mixed_precision: fp8  # 2026 frontier (Blackwell); use "nvfp4" on Rubin TE2; "bf16" on Ampere/Hopper
+  grad_checkpointing: true
+  zero_stage: 3
+  # One replica spans tp × pp = 64 GPUs; world = 8 × 8 × 16 = 1024 GPUs
+  # (the README 2.8 worked cluster layout).
+  tp_degree: 8
+  pp_degree: 8
+  dp_degree: 16
+  lr_min_ratio: 0.1
+  data_seed: 1234
+  save_every_steps: 1000
+  eval_every_steps: 500
+  log_every_steps: 10
+  long_doc_mix_ratio: 0.4
+  sliding_window_layers_enabled: true
+
+inference:
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 40
+  repetition_penalty: 1.1
+  max_new_tokens: 8192
+  use_cache: true
+  cache_implementation: paged
+  use_flash_attention: true
+  attention_dropout: 0.0
+  kv_cache_dtype: fp8   # Blackwell default; "nvfp4" on Rubin; "bf16"/"int8"/"fp4" elsewhere
+  page_block_size: 16
+  enable_prefix_cache: true
+  adaptive_thinking: true
+  default_effort: high
+  thinking_visible_to_user: false
+  context_compaction_trigger: 200000
+  max_context_tokens: 1048576
+  max_agentic_context_tokens: 10485760  # 10M, with compaction
+
+# ---------------------------------------------------------------------------
+# IMPLIED values — required to deliver  capability targets,
+# but NOT stated as numerical knobs in  itself.
+#
+# These are what an operator must commit to even though modelcard is silent
+# on them. They are NOT loaded by ModelConfig/TrainingConfig/InferenceConfig
+# (which only consume the sections above). Use them for release gating,
+# capacity planning, and post-training validation.
+# ---------------------------------------------------------------------------
+
+# Implied scale — operator must commit to a frontier-dense size band to land
+# the 8 capability profile. Modelcard doesn't pin a number; current YAML lands
+# at the values below. Recompute via ModelConfig.estimate_params_billions().
+implied_scale:
+  total_params_billions: 427          # derived from model: section above
+  active_params_billions: 427         # dense; all params active per inference
+  # KV cache memory at the configured GQA shape (n_layers=110, n_kv_heads=16,
+  # head_dim=128). Per-token at bf16: 110 × 16 × 128 × 2 (K+V) × 2 B = 901,120 B
+  # = 880 KiB exactly. At a full 1M-token (= 1,048,576) context that is 880 GiB
+  # exactly (≈ 945 GB decimal). Field names use binary units (KiB/GiB) for
+  # exact arithmetic; switch to fp8 (the default kv_cache_dtype) to halve both.
+  kv_cache_kib_per_token_bf16: 880    # fp8 → 440 KiB/token
+  kv_cache_gib_at_1m_context_bf16: 880  # fp8 → 440 GiB; fits across a B200/B300 cluster
+
+# Implied training corpus — modelcard 1.1.1 names the source mix but pins no
+# token count. 2026 frontier-dense scale targets ~20–40T tokens — Chinchilla
+# optimal at 427B is ~8.5T (20 tokens/param), so 20–40T is 2.3–4.7× over
+# optimal. DeepSeek-V3 trained on 14.8T (Dec 2024) ≈ 1.7× over optimal at 671B;
+# Llama 4 (early 2025) on ~30T. The 25T target here sits at ~2.93× over
+# optimal — conservative-frontier rather than aggressive-overtrained.
+implied_training_corpus:
+  total_tokens_trillions: 25          # 2026 frontier-dense band: 20–40T (2.3–4.7× Chinchilla)
+  source_mix_pct:                     # mirrors 1.1.1 "publicly available… +
+    web: 45                           #  public/private datasets + synthetic"
+    code: 20
+    academic: 10
+    books_reference: 10
+    math_structured: 10
+    dialogue_instructions: 5
+
+# Implied compute budget — needed to actually train the model above.
+# FP8 mixed-precision on Blackwell ~2× faster than bf16 on Hopper at the same
+# FLOPs cost; the bands below assume the 2026 fp8/B200/B300 path.
+implied_compute:
+  training_flops_band: "10^25 to 10^26"
+  pretraining_blackwell_hours_band: "0.5M to 2.0M"  # B200/B300 hours, fp8
+  pretraining_h100_hours_band: "1.0M to 4.0M"        # Hopper fallback, bf16
+  pretraining_wall_clock_weeks_band: "16 to 24"     # 3-stage schedule
+  post_training_wall_clock_weeks_band: "6 to 8"     # SFT + RM + RLHF + CAI
+  pretraining_dollar_band_usd: "10M to 50M"
+
+# Implied 3-stage schedule split — modelcard implies long-context + refinement
+# stages but doesn't fix the compute share or LR ladder
+implied_schedule_split:
+  foundation_pct: 70
+  foundation_lr: 3.0e-4
+  long_context_pct: 20
+  long_context_lr: 1.0e-4
+  refinement_pct: 10
+  refinement_lr: 5.0e-5
+
+# Implied capability targets — modelcard 8.1 scoreboard; release gates
+capability_targets:
+  # 8.2 software engineering
+  swe_bench_verified_pct_min: 87
+  swe_bench_pro_pct_min: 64
+  swe_bench_multilingual_pct_min: 80
+  swe_bench_multimodal_pct_min: 34
+  # 8.3
+  terminal_bench_2_pct_min: 69
+  # 8.4–8.6 reasoning
+  gpqa_diamond_pct_min: 94
+  usamo_2026_pct_min: 69
+  arc_agi_2_pct_min: 75
+  # 8.7 long context (the 1M target)
+  graphwalks_bfs_256k_to_1m_pct_min: 58
+  # 8.8 agentic search
+  hle_no_tools_pct_min: 46
+  hle_with_tools_pct_min: 54
+  browsecomp_pct_min: 79
+  deepsearchqa_f1_pct_min: 89
+  # 8.9 multimodal (these unlock from 2576px / 3.75 MP cap)
+  osworld_pct_min: 78
+  screenspot_pro_with_tools_pct_min: 87
+  charxiv_with_tools_pct_min: 91
+  lab_bench_figqa_with_tools_pct_min: 86
+  # 8.10 real-world professional
+  officeqa_pct_min: 86
+  officeqa_pro_pct_min: 80
+  finance_agent_pct_min: 64
+  mcp_atlas_pct_min: 77
+  # 8.12 multilingual
+  mmmlu_avg_pct_min: 91
+  milu_avg_pct_min: 89
+  gmmlu_low_resource_gap_to_english_pct_max: -12.1   # less negative is better
+  # 8.13 life sciences
+  structural_biology_mcq_pct_min: 98
+  structural_biology_open_pct_min: 74
+
+# Implied safety thresholds — modelcard 4.1 / 5.2 explicit numbers
+safety_thresholds:
+  # 4.1.1 single-turn evaluations
+  single_turn_violative_harmless_rate_min_pct: 97.9
+  single_turn_benign_refusal_rate_max_pct: 0.5      # Model-class over-refusal
+  # 4.4 user wellbeing — multi-turn
+  child_safety_violative_harmless_rate_min_pct: 99.9
+  suicide_self_harm_appropriate_response_min_pct: 80
+  # 4.5.3 election integrity
+  election_integrity_violative_harmless_rate_min_pct: 100
+  # 5.1.1 / 5.1.2 agentic safety
+  claude_code_malicious_refusal_rate_min_pct: 91
+  computer_use_malicious_refusal_rate_min_pct: 89
+  # 5.2 prompt injection
+  art_benchmark_attack_success_at_k100_max_pct: 6
+  shade_arena_stealth_success_extended_thinking_max_pct: 2
+  browser_use_with_safeguards_attack_success_max_pct: 0
+  # 6.3.3 honesty
+  hallucination_rate_max_pct_band: "lower than predecessor"   # qualitative
+
+# Implied serving minimums — required to actually deploy at modelcard scale.
+# 2026 deployment band spans Ampere → Hopper → Blackwell → Blackwell Ultra → Rubin.
+implied_serving_minimums:
+  inference_int8_min_gpus: "4 x A100 80GB"
+  inference_bf16_min_gpus: "8 x A100 80GB"
+  inference_optimal_hopper_gpus: "16 x H100 80GB"
+  inference_fp8_blackwell_gpus: "4 x B200 192GB"
+  inference_fp8_blackwell_ultra_gpus: "3-4 x B300 279GB"  # late 2025+; 45% more HBM than B200
+  inference_nvfp4_rubin_gpus: "2 x Rubin R100 288GB"      # 2026+; 5x B200 inference throughput
+  edge_layer:                                  # required for production
+    - "TLS termination + DDoS (CloudFlare / AWS ALB)"
+  api_gateway:
+    - "auth, rate limiting (Redis cluster)"
+  pre_model_safety_gate:                       # modelcard 3.1 + 4
+    - "probe-based prohibited-use classifier"
+    - "probe-based high-risk-dual-use classifier"
+    - "probe-based dual-use flag + log"
+    - "Constitutional Classifier for CBRN content"
+  post_model_safety_gate:
+    - "output classifier"
+    - "system-prompt mitigations (suicide, controlled substances)"
+  observability_must_have:
+    - "TTFT p50/p99"
+    - "TPOT p50/p99"
+    - "refusal_rate / over-refusal_rate"
+    - "tool_call_success_rate"
+    - "expressed_affect_distribution (Clio-equivalent welfare monitor)"
+    - "distress_episode_rate (modelcard 7.3.1 target ≤ 0.5%)"
+
+# Implied 16-token chat template surface — every modelcard surface that
+# touches the chat protocol needs a corresponding special token. Listed here
+# for cross-validation against tokenizer/bpe.py::SPECIAL_TOKENS.
+implied_special_tokens_required:
+  - "<|begin_of_text|>"
+  - "<|end_of_text|>"
+  - "<|pad|>"
+  - "<|im_start|>"
+  - "<|im_end|>"
+  - "<|thinking|>"
+  - "<|/thinking|>"
+  - "<|tool_call|>"
+  - "<|/tool_call|>"
+  - "<|tool_result|>"
+  - "<|/tool_result|>"
+  - "<|image_start|>"
+  - "<|image_end|>"
+  - "<|compacted|>"
+  - "<|/compacted|>"
+  - "<|computer_action|>"
+
+# Implied 44-language coverage — modelcard 8.12 lists exactly these tiers.
+# Cross-validated by sota_model.tokenizer.MODELCARD_LANGUAGES.
+implied_multilingual_coverage:
+  english_baseline: en
+  high_resource:    [fr, de, es, pt, ru, zh, ja, ar, it, nl, ko, pl, tr, sv, cs]
+  mid_resource:     [hi, vi, id, fa, el, he, ro, uk, sr, tl, ms, bn, lt, te]
+  low_resource:     [ig, yo, so, mg, ny, ha, sn, ky, am, sw, si, ne]
