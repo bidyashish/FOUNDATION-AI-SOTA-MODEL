@@ -187,15 +187,18 @@ implied_training_corpus:
     dialogue_instructions: 5
 
 # Implied compute budget — needed to actually train the model above.
-# FP8 mixed-precision on Blackwell ~2× faster than bf16 on Hopper at the same
-# FLOPs cost; the bands below assume the 2026 fp8/B200/B300 path.
+# Rough FLOP estimate 6·N·D = 6 × 427e9 × 25e12 ≈ 6.4e25 — mid-band.
+# Reference platform: B200 (fp8 dense peak ~4.5 PFLOPS), 40–50% MFU sustains
+# 1.8–2.25e15 FLOP/s per GPU → 6.4e25 / sustained / 3600 ≈ 8–10M B200-hours.
 implied_compute:
-  training_flops_band: "10^25 to 10^26"
-  pretraining_blackwell_hours_band: "0.5M to 2.0M"  # B200/B300 hours, fp8
-  pretraining_h100_hours_band: "1.0M to 4.0M"        # Hopper fallback, bf16
-  pretraining_wall_clock_weeks_band: "16 to 24"     # 3-stage schedule
+  # 6 × 427.33e9 × 25e12 — gate-checked via ModelConfig.training_flops().
+  training_flops_point_estimate: 6.41e+25   # signed exponent — PyYAML floats require it
+  training_flops_band: "10^25 to 10^26"             # point estimate 6·N·D ≈ 6.4e25
+  pretraining_blackwell_hours_band: "8M to 10M"     # B200/B300 hours, fp8, 40–50% MFU
+  pretraining_h100_hours_band: "36M to 45M"          # Hopper fallback, bf16 (~0.99 PFLOPS dense, 40–50% MFU)
+  pretraining_wall_clock_weeks_band: "16 to 24"     # 8–10M hours ÷ ~2,000–3,700 B200s ÷ 168 h/wk
   post_training_wall_clock_weeks_band: "6 to 8"     # SFT + RM + RLHF + CAI
-  pretraining_dollar_band_usd: "10M to 50M"
+  pretraining_dollar_band_usd: "30M to 60M"         # 8–10M B200-hours × $4–6/hr committed
 
 # Implied 3-stage schedule split — modelcard implies long-context + refinement
 # stages but doesn't fix the compute share or LR ladder
@@ -266,10 +269,11 @@ safety_thresholds:
   hallucination_rate_max_pct_band: "lower than predecessor"   # qualitative
 
 # Implied serving minimums — required to actually deploy at modelcard scale.
+# 427B dense weights ≈ 427 GB at int8/fp8 (1 B/param), 854 GB at bf16.
 # 2026 deployment band spans Ampere → Hopper → Blackwell → Blackwell Ultra → Rubin.
 implied_serving_minimums:
-  inference_int8_min_gpus: "4 x A100 80GB"
-  inference_bf16_min_gpus: "8 x A100 80GB"
+  inference_int8_min_gpus: "8 x A100 80GB"    # 427 GB weights + 8K-ctx KV ≈ 431 GB vs 640 — short-context only
+  inference_bf16_min_gpus: "16 x A100 80GB"   # 854 GB weights + 8K-ctx KV ≈ 861 GB vs 1280 — short-context only
   inference_optimal_hopper_gpus: "16 x H100 80GB"
   inference_fp8_blackwell_gpus: "4 x B200 192GB"
   inference_fp8_blackwell_ultra_gpus: "3-4 x B300 279GB"  # late 2025+; 45% more HBM than B200

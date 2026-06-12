@@ -153,44 +153,49 @@ Starting from defaults (P = 427.3B), how does P change if you nudge one knob:
 
 | Knob | Δknob | ΔP | ΔP / Δ% |
 |---|---|---|---|
-| `d_model`      | 16384 → 14336 (−12.5%) | −51 B | −12% |
-| `d_model`      | 16384 → 20480 (+25%)   | +118 B | +28% |
+| `d_model`      | 16384 → 14336 (−12.5%) | −61 B | −14% |
+| `d_model`      | 16384 → 20480 (+25%)   | +128 B | +30% |
 | `n_layers`     | 110 → 84 (−24%)         | −99 B | −23% |
 | `n_layers`     | 110 → 144 (+31%)        | +130 B | +30% |
 | `ffn_dim`      | 65536 → 49152 (−25%)    | −89 B | −21% |
 | `ffn_dim`      | 65536 → 81920 (+25%)    | +89 B | +21% |
-| `vocab_size`   | 200K → 128K (−36%)      | −2.3 B | −0.5% |
-| `n_q_heads`    | 128 → 96 (−25%)         | −18 B | −4% |
-| `n_kv_heads`   | 16 → 8 (−50%)           | −2 B | −0.5% |
+| `vocab_size`   | 200K → 128K (−36%)      | −2.4 B | −0.6% |
+| `n_q_heads`    | 128 → 96 (−25%)         | −15 B | −3.5% |
+| `n_kv_heads`   | 16 → 8 (−50%)           | −3.7 B | −0.9% |
 
-**Highest leverage:** `n_layers`, `d_model`, `ffn_dim`, in that order. **Lowest leverage:** `n_kv_heads`, `vocab_size`. A tornado-style takeaway: changing depth × 1.3 changes params more than changing vocab × 1.5.
+The `d_model` rows move `n_q_heads`/`n_kv_heads` with the width (the config gate pins `n_q_heads × head_dim = d_model`, so width never moves alone) while holding `ffn_dim` fixed; the `n_q_heads` row holds `d_model` fixed and is shown for leverage only — standalone it fails the gate.
+
+**Highest leverage:** `d_model` (heads riding along), `n_layers`, `ffn_dim`, in that order. **Lowest leverage:** `n_kv_heads`, `vocab_size`. A tornado-style takeaway: changing depth × 1.3 changes params more than changing vocab × 1.5.
 
 #### 3.1.2 Combinations that hit a target P
 
-Worked grid for picking (`d_model`, `n_layers`, `ffn_dim`) at fixed vocab=200K, n_q=128, n_kv=16, head_dim=128, untied:
+Worked grid for picking (`d_model`, `n_layers`, `ffn_dim`) at vocab=200K, head_dim=128, untied, with the heads following the width — `n_q = d_model / 128`, `n_kv = n_q / 8` (the config gate requires `n_q × head_dim = d_model`; every P below reproduces via `ModelConfig(...).estimate_params_billions()`):
 
 | `d_model` | `n_layers` | `ffn_dim` | `ffn_dim/d_model` | P (B) | Use case |
 |---|---|---|---|---|---|
-| 12288 | 80  | 49152  | 4.0 | ~187 B | "200B target" |
-| 12288 | 96  | 49152  | 4.0 | ~219 B | 200B target, deeper |
-| 14336 | 96  | 57344  | 4.0 | ~318 B | mid-band |
-| 16384 | 96  | 65536  | 4.0 | ~378 B | shallower than this repo |
+| 12288 | 80  | 49152  | 4.0 | ~177 B | 200B-class, shallow |
+| 12288 | 96  | 49152  | 4.0 | ~211 B | 200B target, deeper |
+| 14336 | 96  | 57344  | 4.0 | ~287 B | mid-band |
+| 16384 | 96  | 65536  | 4.0 | ~374 B | shallower than this repo |
 | 16384 | 110 | 49152  | 3.0 | ~345 B | **tapered (preset)** |
-| 16384 | 110 | 65536  | 4.0 | **427 B** | **this repo, uniform** |
-| 16384 | 144 | 65536  | 4.0 | ~553 B | deeper |
-| 18432 | 110 | 73728  | 4.0 | ~534 B | wider |
-| 20480 | 110 | 81920  | 4.0 | ~657 B | "600B target" |
-| 20480 | 144 | 81920  | 4.0 | ~853 B | "850B frontier" |
+| 16384 | 110 | 65536  | 4.0 | **427 B** | **sota_4_7, uniform** |
+| 16384 | 144 | 65536  | 4.0 | ~557 B | deeper |
+| 18432 | 110 | 73728  | 4.0 | ~540 B | wider |
+| 18432 | 128 | 73728  | 4.0 | **627 B** | **sota_ultra_5 (UltraModel 5)** |
+| 20480 | 110 | 81920  | 4.0 | ~666 B | "650B target" |
+| 20480 | 144 | 81920  | 4.0 | ~869 B | "850B frontier" |
 
 **Recipe to land at any P target (uniform layers):**
 
 ```
 1. Pick d_model from {12288, 14336, 16384, 18432, 20480}.
-2. Pick ffn_dim = 4 × d_model (frontier convention).
-3. Solve for n_layers:
+2. Set n_q = d_model / head_dim — the gate requires n_q × head_dim = d_model —
+   and n_kv = n_q / 8 (the 8:1 GQA ratio).
+3. Pick ffn_dim = 4 × d_model (frontier convention).
+4. Solve for n_layers:
      P_per_layer ≈ d_model × (n_q × head_dim × 2 + n_kv × head_dim × 2 + ffn_dim × 3)
-     n_layers ≈ (P_target − P_embed_head) / P_per_layer
-4. If n_layers ends up outside [80, 180], adjust d_model.
+     n_layers ≈ (P_target − 2 × vocab_size × d_model) / P_per_layer
+5. If n_layers ends up outside [80, 180], adjust d_model.
 ```
 
 For per-layer heterogeneity (tapered FFN), use `tapered_ffn_overrides` — see [`README.md` §1.2.1](../README.md#121-per-layer-heterogeneity-not-all-layers-are-the-same).
@@ -245,16 +250,19 @@ where N = total params, D = total training tokens
 
 #### 3.3.1 Cross-product: (P × tokens) → FLOPs
 
-| P (B) | Tokens (T) | FLOPs | Band ref | Wall-clock |
+| P (B) | Tokens (T) | FLOPs | Band ref | Wall-clock (fp8, 45% MFU) |
 |---|---|---|---|---|
-| 200 | 15  | 1.8 × 10²⁵ | "10²⁵ entry" | ~12 weeks @ 1k H100 |
-| 200 | 25  | 3.0 × 10²⁵ | mid 10²⁵ | ~16 weeks |
-| 427 | 18  | 4.6 × 10²⁵ | mid 10²⁵ | ~22 weeks |
-| **427** | **25**  | **6.4 × 10²⁵** | **upper 10²⁵ — this repo** | **~24 weeks @ 2k H100, ~16 weeks @ 2k B200 (fp8)** |
-| 427 | 40  | 1.0 × 10²⁶ | 10²⁶ | ~32 weeks |
-| 600 | 30  | 1.1 × 10²⁶ | 10²⁶ | ~34 weeks |
-| 700 | 35  | 1.5 × 10²⁶ | 10²⁶ | ~42 weeks |
-| 1000 | 40 | 2.4 × 10²⁶ | upper 10²⁶ | ~60 weeks |
+| 200 | 15  | 1.8 × 10²⁵ | "10²⁵ entry" | ~14 weeks @ 1k B200 |
+| 200 | 25  | 3.0 × 10²⁵ | mid 10²⁵ | ~24 weeks @ 1k B200 |
+| 427 | 18  | 4.6 × 10²⁵ | mid 10²⁵ | ~18 weeks @ 2k B200 |
+| **427** | **25**  | **6.4 × 10²⁵** | **upper 10²⁵ — sota_4_7** | **~26 weeks @ 2k B200, ~13 @ 4k** |
+| 427 | 40  | 1.0 × 10²⁶ | 10²⁶ | ~41 weeks @ 2k B200 |
+| 600 | 30  | 1.1 × 10²⁶ | 10²⁶ | ~22 weeks @ 4k B200 |
+| **627** | **36** | **1.35 × 10²⁶** | **upper 10²⁶ — sota_ultra_5** | **~14 weeks @ 4.6k B300 (64 NVL72 racks)** |
+| 700 | 35  | 1.5 × 10²⁶ | 10²⁶ | ~29 weeks @ 4k B200 |
+| 1000 | 40 | 2.4 × 10²⁶ | upper 10²⁶ | ~48 weeks @ 4k B200 |
+
+Wall-clock = `F ÷ (n_GPUs × peak × MFU)`. B200 fp8 dense peak 4.5 PFLOPS × 45% ≈ 2.0×10¹⁵ FLOP/s sustained per GPU; B300 7.5 PFLOPS × 45% ≈ 3.4×10¹⁵ (`config.gpu_hours`). The bf16 H100 fallback (~0.99 PFLOPS dense) needs ≈7.6× the GPU-hours — 6.4×10²⁵ FLOPs is ~116 weeks on 2k H100s, which is why the fp8 Blackwell path is the reference platform throughout this repo.
 
 #### 3.3.2 Chinchilla-optimal vs frontier-overtrained
 
@@ -266,7 +274,7 @@ The published Chinchilla scaling law says **D ≈ 20 × N is compute-optimal**:
 | 427 | 8.5  | 25    | 3× |
 | 700 | 14.0 | 30–35 | 2–2.5× |
 
-Frontier-dense **overtrains** because compute is cheaper than the marginal eval gain at the optimal point — DeepSeek-V3 trained for 14.8T at 671B (overtrained 2.5×); Llama 3 405B trained for 15T (overtrained 9×). The 25T/427B in this repo lands at ~3× overtrain.
+Frontier-dense **overtrains** because compute is cheaper than the marginal eval gain at the optimal point — Llama 3 405B trained for ~15.6T (≈1.9× its 8.1T optimum); DeepSeek-V3's 14.8T at 671B *total* params is ≈1.1×, but on its ~37B *active* params (MoE — the N that 20·N applies to per-token) it is ≈20×. The 25T/427B in this repo lands at ~3× overtrain; the 36T/627B ultra spec at ~2.9×.
 
 ### 3.4 GPU memory at training (per replica)
 
@@ -302,11 +310,11 @@ For 427B at 1M context (the headline serving config):
 
 | Precision (weights / KV) | Weights (GB) | KV at 1M (GB) | Total | Min GPUs |
 |---|---:|---:|---:|---|
-| bf16 / bf16 | 855 | 880 | 1735 | 12 × A100-80 (TP=8 PP=2 × 1.5) |
-| bf16 / int8 | 855 | 440 | 1295 | 8 × A100-80 |
-| fp8 / fp8   | 428 | 440 | 868  | 4 × B200-192 OR **4 × B300-279** (extra headroom for batch) |
+| bf16 / bf16 | 855 | 880 | 1735 | 24 × A100-80 (TP=8 × PP=3, 1920 GB) |
+| bf16 / int8 | 855 | 440 | 1295 | 20 × A100-80 (TP=4 × PP=5, 1600 GB) |
+| fp8 / fp8   | 428 | 440 | 868  | 8 × B200-192 OR **4 × B300-279** (1116 GB) |
 | fp8 / fp4   | 428 | 220 | 648  | 4 × B200-192 OR **3 × B300-279** |
-| int4 / int4 | 214 | 220 | 434  | **2 × B200-192** OR **2 × B300-279** OR **2 × Rubin-288** |
+| int4 / int4 | 214 | 220 | 434  | **4 × B200-192** OR **2 × B300-279** OR **2 × Rubin-288** |
 | **NVFP4 / NVFP4** | **214** | **220** | **434** | **2 × Rubin-288** (1 GPU at lower context) |
 
 For 427B at **200K context** (single-GPU possibilities open up at this size):
@@ -321,7 +329,7 @@ For 427B at **10M agentic context** (with compaction holding the working set bou
 
 | Precision | Weights | KV at 1M working set | Total | Min GPUs |
 |---|---:|---:|---:|---|
-| fp8 / fp8 | 428 | 440 | 868 | 4 × B200-192 |
+| fp8 / fp8 | 428 | 440 | 868 | 8 × B200-192 |
 | fp8 / fp4 | 428 | 220 | 648 | 4 × B200-192 |
 | **NVFP4 / NVFP4** | **214** | **220** | **434** | **2 × Rubin-288** with compaction-managed working set |
 
@@ -362,16 +370,16 @@ model:
   n_kv_heads: 12             # 8:1 GQA
   head_dim: 128
   ffn_dim: 49152             # 4 × d_model
-  layer_overrides: {}        # uniform; tapering would land at ~165B
+  layer_overrides: {}        # uniform; tapered_ffn_overrides(96, 4, 36864) lands ~172B
 
-# Estimated: 219 B params
+# Estimated: 211 B params (ModelConfig(...).estimate_params_billions())
 training:
   mixed_precision: fp8
   global_batch_tokens: 4194304
 implied_training_corpus:
-  total_tokens_trillions: 18  # Chinchilla overtrained ~4×
+  total_tokens_trillions: 18  # Chinchilla overtrained ~4× (optimal 20 × 211B ≈ 4.2T)
 implied_compute:
-  training_flops_band: "2.4 × 10^25"
+  training_flops_point_estimate: 2.28e25   # 6 × 211e9 × 18e12
 ```
 
 ### 4.2 "Frontier-dense at 600B" (Llama-4-class dense)
@@ -380,13 +388,13 @@ implied_compute:
 model:
   vocab_size: 200000
   d_model: 20480
-  n_layers: 110
-  n_q_heads: 160
-  n_kv_heads: 20
+  n_layers: 100              # 110 would overshoot to ~666B at this width
+  n_q_heads: 160             # × head_dim 128 = d_model 20480
+  n_kv_heads: 20             # 8:1 GQA
   head_dim: 128
   ffn_dim: 81920             # 4 × d_model
 
-# Estimated: 657 B params
+# Estimated: 606 B params (ModelConfig(...).estimate_params_billions())
 training:
   mixed_precision: fp8
   global_batch_tokens: 8388608  # 8M, scales with model
@@ -416,14 +424,14 @@ implied_training_corpus:
 
 ### 4.4 "I have a fixed compute budget of 10^25 FLOPs"
 
-Solve for compute-optimal vs frontier-overtrained:
+Solve for compute-optimal vs frontier-overtrained. At D = 20·r·N (overtrain ratio r), F = 6·N·D = 120·r·N², so N = √(F / 120r):
 
 ```
-Chinchilla-optimal:    P ≈ 64 B,  D ≈ 1.3 T tokens
-Frontier-overtrained:  P ≈ 220 B, D ≈ 7.6 T tokens   (3× overtrain)
+Chinchilla-optimal (r=1):   P ≈ 290 B, D ≈ 5.8 T tokens    (6 × 290e9 × 5.8e12 ≈ 1.0e25)
+Frontier-overtrained (r=3): P ≈ 170 B, D ≈ 9.8 T tokens    (6 × 170e9 × 9.8e12 ≈ 1.0e25)
 ```
 
-The frontier path takes ~3× more wall-clock for the same FLOPs (deeper net forward), but each parameter's loss-bits-per-flop is higher because the model is closer to its capacity ceiling on the given data.
+Same FLOPs, same wall-clock on the same cluster — but the overtrained model comes out ~40% smaller, so it serves at ~60% of the per-token weight cost and KV-adjacent latency for its whole deployment life (at ~1.7× the optimizer steps during training). That serving asymmetry is why every 2026 frontier-dense run overtrains.
 
 ### 4.5 "Memory-tight inference on 4× A100-80"
 
@@ -480,7 +488,7 @@ ffn_dim           ±16K           ~ ±0.85×
 d_model           ±4K            ~ ±1.2×    (quadratic in attention; linear-and-quadratic in FFN)
 n_q_heads         ±32 heads      ~ ±0.15×
 vocab_size        ±50K           ~ ±0.03×
-n_kv_heads        ±4 heads       ~ ±0.005×  (nearly invisible at frontier scale)
+n_kv_heads        ±4 heads       ~ ±0.02×   (nearly invisible at frontier scale)
 head_dim          ±32            ~ ±0.20×
 ```
 
@@ -551,9 +559,11 @@ Given (target_param_count, target_context, target_hardware, target_cost_band), t
 
 | Target ctx | A100 80 GB | H100 80 GB | B200 192 GB | B300 279 GB | Rubin 288 GB |
 |---|---|---|---|---|---|
-| 200K | 4 GPUs, int8 KV | 4 GPUs, fp8 KV | 2 GPUs, fp8 KV | **1 GPU, fp8 KV** (with int4 weights) | **1 GPU, NVFP4** |
-| 1M   | 8 GPUs, int8 KV | 8 GPUs, fp8 KV | 4 GPUs, fp8 KV | 3-4 GPUs, fp8 KV | 2 GPUs, NVFP4 |
+| 200K | 4 GPUs, int8 KV | 4 GPUs, fp8 KV | 2 GPUs, fp8 KV | **1 GPU, int8 KV** (with int4 weights, ~258 GB) | **1 GPU, NVFP4** |
+| 1M   | 16 GPUs, int8 KV | 16 GPUs, fp8 KV | 4 GPUs, fp4 KV (8 at fp8 KV) | 4 GPUs, fp8 KV (3 at int8 KV) | 2 GPUs, NVFP4 |
 | 10M (compaction) | 16 GPUs, int4 KV + compaction at 200K | 16 GPUs, fp8 KV + compaction | 8 GPUs, fp8/fp4 + compaction | 6 GPUs, fp8/fp4 + compaction | 4 GPUs, NVFP4 + compaction (or 1 GPU + Rubin CPX) |
+
+The 200K row assumes weight-only int4 (the §4.5 recipe, ~214 GB of weights) on A100/H100/B200 — at fp8/int8 the 427 GB of weights alone exceed 4 × 80 GB.
 
 ### 6.3 Pick by `(target_TTFT_p99, target_TPOT_p99)` — public API SLA
 

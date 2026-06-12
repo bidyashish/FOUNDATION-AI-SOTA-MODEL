@@ -195,6 +195,29 @@ class ModelConfig:
         head = 0 if self.tie_embeddings else self.vocab_size * self.d_model
         return (emb + attn + ffn + norms + head) / 1e9
 
+    def kv_cache_bytes_per_token(self, bytes_per_element: int = 2) -> int:
+        """Per-token KV-cache bytes at the uniform cache shape.
+
+        n_layers × n_kv_heads × head_dim × 2 (K+V) × bytes_per_element.
+        bytes_per_element: 2 for bf16/fp16 (default), 1 for fp8/int8.
+        Uniform across layers by the paged-KV-cache invariant (see LayerConfig),
+        so per-layer overrides never change this number. This is the single
+        home of the formula behind `implied_scale.kv_cache_kib_per_token_bf16`
+        (validated by scripts/validate_config.py).
+        """
+        return self.n_layers * self.n_kv_heads * self.head_dim * 2 * bytes_per_element
+
+    def training_flops(self, total_tokens: float) -> float:
+        """Pretraining FLOPs by the standard 6·N·D estimate.
+
+        N = estimate_params_billions() × 1e9 (dense — every param is active
+        on every token), D = total_tokens. Single home of the formula behind
+        `implied_compute.training_flops_point_estimate` (validated by
+        scripts/validate_config.py); the GPU-hour / wall-clock / dollar bands
+        in that section all derive from this number via `gpu_hours`.
+        """
+        return 6.0 * self.estimate_params_billions() * 1e9 * total_tokens
+
     def per_layer_param_breakdown(self) -> list[dict]:
         """Diagnostic table — one row per layer with its effective shape.
 
@@ -222,6 +245,17 @@ class ModelConfig:
     def from_yaml(cls, path: str | Path) -> "ModelConfig":
         data = yaml.safe_load(Path(path).read_text())
         return cls(**data["model"])
+
+
+def gpu_hours(flops: float, peak_flops_per_gpu: float, mfu: float) -> float:
+    """GPU-hours to spend `flops` at a sustained fraction `mfu` of peak.
+
+    flops ÷ (peak_flops_per_gpu × mfu) ÷ 3600 — the formula behind the
+    `implied_compute.*_hours_band` derivation comments in the YAMLs, e.g.
+    UltraModel 5: gpu_hours(1.354e26, 7.5e15, 0.40 … 0.50) ≈ 12.5M … 10.0M
+    B300-hours (B300 fp8 dense peak 7.5 PFLOPS at 40–50% MFU).
+    """
+    return flops / (peak_flops_per_gpu * mfu) / 3600.0
 
 
 def tapered_ffn_overrides(

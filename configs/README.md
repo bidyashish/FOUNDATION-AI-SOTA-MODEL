@@ -27,6 +27,7 @@ production safeguards + fallback to the latest SuperModel). Key deltas vs `sota_
 | training tokens | 25T | 36T (≈2.9× Chinchilla at 627B) |
 | `global_batch_tokens` / `lr` | 4M / 3e-4 | 8M / 2.5e-4 |
 | `total_steps` (= corpus tokens ÷ batch) | 6M | 4.3M (split 70/20/10 by `training/schedule.py`) |
+| `implied_compute` 6·N·D anchor (gate-checked) | 6.41×10²⁵ (8–10M B200-hr fp8) | 1.354×10²⁶ (10–13M B300-hr fp8; `ModelConfig.training_flops(36e12)`) |
 | TP × PP × DP (world size) | 8 × 8 × 16 = 1024 GPUs | 9 × 8 × 64 = 4608 B300s — one GB300 NVL72 rack per replica; TP 9 divides the 18 KV heads |
 | batch identity (seq × micro × accum × dp) | 8192 × 2 × 16 × 16 | 8192 × 1 × 16 × 64 (enforced by `TrainingConfig`) |
 | `thinking_budgets.max` | 32768 | 131072 (card's "xhigh" maps here) |
@@ -65,9 +66,9 @@ batch, LR, `thinking_budgets.max`, and the re-pinned `capability_targets` /
   │ implied_scale                   │ 427B params, 880 KB/tok, 880 GB at 1M                                                                    │ modelcard places SM4.7 in frontier-dense band but pins │
   │                                 │                                                                                                          │  no number                                             │
   ├─────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────┤  
-  │ implied_training_corpus         │ 18T tokens, 6-bucket source mix (web 45 / code 20 / academic 10 / books 10 / math 10 / dialogue 5)       │ 1.1.1 names sources, doesn't pin tokens               │  
+  │ implied_training_corpus         │ 25T tokens, 6-bucket source mix (web 45 / code 20 / academic 10 / books 10 / math 10 / dialogue 5)       │ 1.1.1 names sources, doesn't pin tokens               │  
   ├─────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────┤  
-  │ implied_compute                 │ 10²⁵–10²⁶ FLOPs, 1–4M H100·hr, 16–24 weeks, $10–50M                                                      │ required to actually train at this scale               │  
+  │ implied_compute                 │ 10²⁵–10²⁶ FLOPs, 8–10M B200·hr fp8, 16–24 weeks, $30–60M                                                 │ required to actually train at this scale               │  
   ├─────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────┤
   │ implied_schedule_split          │ 70/20/10 compute share + LR ladder 3e-4 / 1e-4 / 5e-5                                                    │ modelcard implies 3 stages, doesn't fix the split      │  
   ├─────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────┤
@@ -77,7 +78,7 @@ batch, LR, `thinking_budgets.max`, and the re-pinned `capability_targets` /
   │ safety_thresholds               │ 4.1 single-turn 97.9%, 4.5.3 election 100%, 5.1.1 Claude Code 91%, 5.2.1 ART k=100 ≤ 6%, 5.2.2.3    │ directly modelcard-pinned — these are deployment gates │
   │                                 │ browser 0%                                                                                               │                                                        │  
   ├─────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-  │ implied_serving_minimums        │ 4× A100 int8 / 8× A100 bf16 / 16× H100 optimal, edge layer, pre/post safety gate, observability list     │ required to deploy at modelcard scale                  │  
+  │ implied_serving_minimums        │ 8× A100 int8 / 16× A100 bf16 / 16× H100 optimal, edge layer, pre/post safety gate, observability list    │ required to deploy at modelcard scale                  │  
   │                                 │ including modelcard 7 distress monitor                                                                  │                                                        │  
   ├─────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────┤
   │ implied_special_tokens_required │ the 16 chat-surface tokens                                                                               │ cross-validated against tokenizer.SPECIAL_TOKENS       │  
@@ -101,7 +102,7 @@ A `grep` over `` confirms what's actually pinned by the system card vs what's an
 | `ffn_dim` | 65,536 | operator | no `ffn_dim` string in modelcard |
 | `max_position_embeddings` | 1,048,576 | **MODELCARD** | 8.7 — 2 hits for `1M tokens/context` |
 | `rope_base` | 1e6 | operator | implied by 1M context (avoid wrap-around), specific value not pinned |
-| `rope_yarn_scale` | 8.0 | operator | implied by 8K→1M extension, value not pinned |
+| `rope_yarn_scale` | 128.0 | operator | must cover the 8K→1M extension ratio (1,048,576 / 8,192 = 128), value not pinned |
 | `rope_yarn_original_max_position` | 8,192 | operator | Stage-1 seq len choice |
 | `sliding_window_size` | 32,768 | operator | modelcard mentions sliding-window attention idea, not size |
 | `sliding_window_layer_stride` | 2 | operator | silent |
@@ -118,11 +119,11 @@ A `grep` over `` confirms what's actually pinned by the system card vs what's an
 | `weight_decay` | 0.1 | operator | silent |
 | `grad_clip` | 1.0 | operator | silent |
 | `warmup_steps` | 2,000 | operator | silent |
-| `total_steps` | 1,000,000 | operator | silent |
+| `total_steps` | 6,000,000 | operator | silent — full-corpus budget: 25T ÷ 4M tokens/step |
 | `seq_len` | 8,192 | operator | Stage-1 choice |
 | `global_batch_tokens` | 4,194,304 | operator | silent |
 | `grad_accum` | 16 | operator | silent |
-| `mixed_precision` | bf16 | operator | no `bf16/bfloat16` string in modelcard |
+| `mixed_precision` | fp8 | operator | no `fp8`/`bf16` string in modelcard |
 | `grad_checkpointing` | true | operator | silent |
 | `zero_stage` | 3 | operator | silent on parallelism / sharding |
 | `tp_degree, pp_degree` | 8, 8 | operator | silent |
@@ -132,7 +133,7 @@ A `grep` over `` confirms what's actually pinned by the system card vs what's an
 | `top_k` | 40 | operator | silent |
 | `repetition_penalty` | 1.1 | operator | silent |
 | `max_new_tokens` | 8,192 | operator | silent |
-| `kv_cache_dtype` | bf16 | operator | silent |
+| `kv_cache_dtype` | fp8 | operator | silent |
 | `page_block_size` | 16 | operator | silent on KV cache implementation |
 | `enable_prefix_cache` | true | operator | silent |
 | `adaptive_thinking` | true | **MODELCARD** | 4.1.1 — 34 hits for `adaptive thinking` |
@@ -141,7 +142,7 @@ A `grep` over `` confirms what's actually pinned by the system card vs what's an
 | `context_compaction_trigger` | 200,000 | **MODELCARD** | 4.5 — 4 hits for `200k` |
 | `max_context_tokens` | 1,048,576 | **MODELCARD** | 8.7 1M context |
 
-**Summary: 7 of 32 listed config fields are directly pinned by `` text.** The other 25 are operator choices that fit within modelcard constraints but are not numerically specified by the system card.
+**Summary: 7 of 46 listed config fields are directly pinned by `` text.** The other 39 are operator choices that fit within modelcard constraints but are not numerically specified by the system card.
 
 ### What this means for "model size" and "training size"
 
@@ -167,8 +168,8 @@ Both configs carry additional sections beyond `model:` / `training:` / `inferenc
 | Section | What it pins | Modelcard tie |
 |---|---|---|
 | `implied_scale` | param count (~427B), KV bytes/token, GB at 1M | Frontier-dense band; modelcard places SM4.7 between SM4.6 and Ultramodel |
-| `implied_training_corpus` | 18T tokens, 6-bucket source mix | 1.1.1 names sources; doesn't pin tokens |
-| `implied_compute` | 10²⁵–10²⁶ FLOPs, 1–4M H100·hr, 16–24 wks, $10–50M | Frontier-dense norms; modelcard silent |
+| `implied_training_corpus` | 25T tokens, 6-bucket source mix | 1.1.1 names sources; doesn't pin tokens |
+| `implied_compute` | 10²⁵–10²⁶ FLOPs, 8–10M B200·hr fp8, 16–24 wks, $30–60M | Frontier-dense norms; modelcard silent |
 | `implied_schedule_split` | 70/20/10 compute share, LR ladder 3e-4 / 1e-4 / 5e-5 | Modelcard implies 3 stages, doesn't fix the split |
 | `capability_targets` | every 8.1 scoreboard number as a release gate | **Pinned** — these are modelcard 8 numbers |
 | `safety_thresholds` | 4.1 / 4.4 / 4.5 / 5.1 / 5.2 numerical thresholds | **Pinned** — explicit numbers from 4 / 5 |
@@ -204,16 +205,16 @@ The dataclass-loaded sections (`model:` / `training:` / `inference:`) are what t
 |---|---|---|
 | `vocab_size` | 200,000 | Big enough to compress major non-English languages without byte-fallback dominating; modelcard 8.12 evaluates 44 languages with <-3.6% gap to English on GMMLU. Smaller vocabs (50K–128K) hurt low-resource languages disproportionately. |
 | `d_model` | 16,384 | Sets the model "width." Combined with `n_layers=110` and `ffn_dim=65,536`, gives ~427B dense params (verify via `ModelConfig().estimate_params_billions()`) — the SuperModel 4.7-class scale (400–700B) referenced throughout ``. |
-| `n_layers` | 110 | "Depth." Frontier dense models live in the 96–110 range; deeper helps reasoning chains, beyond ~110 returns diminish and pipeline-parallel bubbles grow. |
+| `n_layers` | 110 | "Depth." Frontier dense models live in the 100–180 band; deeper helps reasoning chains, but wall-clock and pipeline-parallel bubbles grow with depth. |
 | `n_q_heads` | 128 | One query head per 128-dim slice of d_model; standard ratio. |
 | `n_kv_heads` | 16 | **Load-bearing for 1M context.** Ratio 128:16 = 8 means the KV cache is 1/8 the size of a vanilla MHA cache. See [`../src/sota_model/modeling/README.md`](../src/sota_model/modeling/README.md) GQA for the math (~880 GB at 1M tokens vs. ~7 TB without). |
 | `head_dim` | 128 | Standard. Combined with 128 Q-heads, full attention dim = 16,384 = `d_model`. |
-| `ffn_dim` | 65,536 | 4× `d_model` — long-standing default. SwiGLU's gate halves the effective param count vs. plain MLP, so this lands near "4×-equivalent." |
+| `ffn_dim` | 65,536 | 4× `d_model` — deliberately FFN-heavy. SwiGLU has 3 projections, so 4×d costs 12·d² per layer vs 8·d² for a standard 4×d MLP (8/3×d ≈ 2.67×d would param-match). |
 | `norm_eps` | 1e-5 | RMSNorm stability constant. Smaller risks fp16 overflow; larger leaks signal. |
-| `tie_embeddings` | false | At 200B scale the LM head matters; tying constrains it unhelpfully. Smaller models tie embeddings to save params — not relevant here. |
+| `tie_embeddings` | false | At 400B scale the LM head matters; tying constrains it unhelpfully. Smaller models tie embeddings to save params — not relevant here. |
 | `max_position_embeddings` | 1,048,576 | 1M context window. Required for `` 8.7 (MRCR v2, GraphWalks 1M) and 8.8 (10M-token agentic search via 4.5 compaction on top of 1M). |
 | `rope_base` | 1,000,000 | RoPE base raised from the classic 10,000 so high-frequency dimensions don't wrap around at long context. Standard for 1M-context models. |
-| `rope_yarn_scale` | 8.0 | YaRN extends an 8K-trained model to 64K (=8× scale) cleanly; combined with Stage-2 long-context training reaches 1M. Reference: Peng et al. 2023. |
+| `rope_yarn_scale` | 128.0 | Scale × original_max_position must cover the window: 128 × 8,192 = 1,048,576 (the 1M window). A smaller scale (e.g. 8 → only 64K) silently extrapolates beyond its reach and breaks the 1M retrieval targets. Reference: Peng et al. 2023. |
 | `rope_yarn_original_max_position` | 8,192 | The seq length used in Stage-1 pretraining. YaRN interpolates relative to this. |
 | `sliding_window_size` | 32,768 | A subset of layers use sliding-window attention to bound KV memory at long context. 32K is large enough that local-coherence isn't lost, small enough to matter. |
 | `sliding_window_layer_stride` | 2 | Every 2nd layer (excluding layer 0) uses sliding window; the rest stay full-attention so global retrieval (MRCR v2) still works. |
@@ -233,14 +234,14 @@ The dataclass-loaded sections (`model:` / `training:` / `inference:`) are what t
 | `beta1, beta2` | 0.9, 0.95 | β₂=0.95 (vs. classic 0.999) is standard at LLM scale — faster adaptation to changing gradient statistics in the first ~10K steps. |
 | `weight_decay` | 0.1 | Standard for large LMs; smaller WD overfits, larger smooths to no avail. |
 | `grad_clip` | 1.0 | Empirical default. Spikes do happen in early training; clip prevents them from corrupting AdamW's running statistics. |
-| `warmup_steps` | 2,000 | ~0.2% of total. Long enough to stabilize early dynamics, short enough not to waste compute. |
-| `total_steps` | 1,000,000 | Stage-1 length. At global batch 4M tokens × 1M steps = 4T tokens for Stage 1 alone; Stages 2 and 3 add proportionally less compute. |
+| `warmup_steps` | 2,000 | ≈0.03% of the 6M-step budget. Long enough to stabilize early dynamics, short enough not to waste compute. |
+| `total_steps` | 6,000,000 | Full-corpus budget: 25T tokens ÷ 4M tokens/step ≈ 6M optimizer steps. `training/schedule.py` splits the tokens 70/20/10 across the three stages. |
 | `seq_len` | 8,192 | Stage-1 default. Stage 2 ramps to 32K → 131K → 1M. |
-| `global_batch_tokens` | 4,194,304 | 4M tokens/step. Critical-batch-size analyses suggest this regime is near-optimal for ~200B models on web-scale data. |
+| `global_batch_tokens` | 4,194,304 | 4M tokens/step. Critical-batch-size analyses suggest this regime is near-optimal for 400B-class models on web-scale data. |
 | `grad_accum` | 16 | Lets micro-batch fit on a per-replica memory budget without reducing the global batch. |
-| `mixed_precision` | bf16 | Required at this scale. fp16 loss scaling fails at >100B; fp32 wastes half the memory bandwidth. |
+| `mixed_precision` | fp8 | TE fp8 (E4M3 fwd / E5M2 bwd) on Blackwell; bf16 is the Ampere/Hopper fallback. fp16 loss scaling fails at >100B; fp32 wastes memory bandwidth. |
 | `grad_checkpointing` | true | Trades ~30% extra forward FLOPs for ~6× activation-memory savings. Mandatory at 110 layers + 1M context. |
-| `zero_stage` | 3 | Optimizer state + gradients + parameters all sharded across DP replicas. Without ZeRO-3 the optimizer state alone (8 bytes/param × 200B = 1.6 TB) doesn't fit. |
+| `zero_stage` | 3 | Optimizer state + gradients + parameters all sharded across DP replicas. Without ZeRO-3 the optimizer state alone (8 bytes/param × 427B ≈ 3.4 TB) doesn't fit. |
 | `tp_degree` | 8 | One node × 8 GPUs over NVLink. Past 8-way, inter-node TP all-reduces become latency-bound. |
 | `pp_degree` | 8 | Across 8 nodes. 110 layers / 8 ≈ 14 layers/stage — small enough that pipeline bubbles stay manageable. |
 
@@ -255,7 +256,7 @@ For the layout math (TP × PP × DP = world_size), see [`../src/sota_model/train
 | `temperature, top_p, top_k, repetition_penalty` | 0.7, 0.95, 40, 1.1 | ``-aligned defaults. Tuned empirically; deviations should be measured against the 8 evaluation suite. |
 | `max_new_tokens` | 8,192 | Default per-call answer cap. Independent of thinking budget. |
 | `cache_implementation` | paged | vLLM-style paged attention. The alternative ("static") doesn't survive arbitrary-length agentic conversations. |
-| `kv_cache_dtype` | bf16 | Default. int8 available for memory-tight deployments at small honesty/MASK regression cost (see modelcard 6.3.3). |
+| `kv_cache_dtype` | fp8 | Blackwell default — halves KV memory vs bf16 (880 → 440 KiB/token at the 4.7 shape). bf16 on Hopper/Ampere; int8 for memory-tight deployments at small honesty/MASK regression cost (see modelcard 6.3.3). |
 | `page_block_size` | 16 | Standard. Trade-off: smaller = less internal fragmentation, more block-table overhead. 16 is the sweet spot for 1M-token contexts. |
 | `enable_prefix_cache` | true | Shared system prompts are reused across many requests. Prefix caching removes the repeated prefill cost. |
 | `adaptive_thinking` | true | **First-class mode** per `` 4.1.1. Set to false to force a fixed effort tier. |

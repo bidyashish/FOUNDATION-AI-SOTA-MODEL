@@ -10,6 +10,8 @@ caught at commit time instead of by hand:
   training       batch identity (seq × micro × accum × dp = global batch),
                  total_steps ≈ corpus ÷ batch, schedule closes the corpus
                  at 70/20/10 with the implied_schedule_split LR ladder
+  compute        training FLOPs point estimate = 6·N·D from the model
+                 section and the corpus commitment
   parallelism    model shape shards at the configured TP/PP
   data           source mix sums to 100, pipeline keys are recognized
   gates          capability/safety thresholds are numeric (or *_band)
@@ -90,7 +92,7 @@ def validate(path: Path, gate: Gate) -> None:
             f"{params_b:.2f}B vs committed {committed}B",
         )
 
-    kv_bytes = model.n_layers * model.n_kv_heads * model.head_dim * 2 * 2
+    kv_bytes = model.kv_cache_bytes_per_token()  # bf16: 2 bytes/element
     kib_field = scale.get("kv_cache_kib_per_token_bf16")
     if kib_field is not None:
         gate.check(
@@ -125,6 +127,18 @@ def validate(path: Path, gate: Gate) -> None:
             abs(train.total_steps - exact) / exact < 0.01,
             "total_steps ≈ corpus ÷ batch",
             f"{train.total_steps:,} vs {exact:,.0f} ({(train.total_steps - exact) / exact:+.2%})",
+        )
+
+    flops_committed = implied.get("implied_compute", {}).get("training_flops_point_estimate")
+    if flops_committed is not None and corpus_t:
+        # float() guards the PyYAML quirk: an unsigned exponent (1.354e26
+        # instead of 1.354e+26) silently loads as a string.
+        flops_committed = float(flops_committed)
+        flops = model.training_flops(corpus_t * 1e12)
+        gate.check(
+            abs(flops - flops_committed) / flops_committed < 0.01,
+            "training FLOPs = 6·N·D",
+            f"{flops:.4g} vs committed {flops_committed:.4g}",
         )
 
     split = implied.get("implied_schedule_split", {})

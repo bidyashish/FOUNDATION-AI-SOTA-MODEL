@@ -342,7 +342,7 @@ tensorboard
 nvidia-dcgm-exporter               # GPU telemetry
 ```
 
-The 2026 frontier-dense path uses **NVIDIA Transformer Engine** for FP8 mixed-precision training (E4M3 forward / E5M2 backward), with bf16 master weights. On Blackwell B200/B300 this delivers ~2× the throughput of bf16-on-Hopper at the same FLOP cost. The bf16 path remains supported as the fallback for Ampere/Hopper-only stacks — set `training.mixed_precision: bf16` in the YAML.
+The 2026 frontier-dense path uses **NVIDIA Transformer Engine** for FP8 mixed-precision training (E4M3 forward / E5M2 backward), with bf16 master weights. FP8 doubles per-GPU throughput vs bf16 on the same silicon, and Blackwell B200 fp8 (~4.5 PFLOPS dense) sustains ≈4.5× an H100 running bf16 (~0.99 PFLOPS dense). The bf16 path remains supported as the fallback for Ampere/Hopper-only stacks — set `training.mixed_precision: bf16` in the YAML.
 
 Full reference for every precision format used here (fp32, bf16, fp16, fp8 E4M3/E5M2, int8, fp4 / MXFP4 / MXFP6 / MXFP8) plus a hardware-coverage matrix (Blackwell, Hopper, Ampere, Google TPU, ARM) and a "which precision should I pick?" flowchart: [`docs/PRECISION.md`](./docs/PRECISION.md).
 
@@ -363,11 +363,11 @@ Aligned with `` 1.1.1: "proprietary mix of publicly available internet informati
 | Math, structured | 10% | ~2.5T | OpenWebMath, AlgebraicStack, scientific datasets, reasoning traces |
 | Dialogue / instructions | 5% | ~1.3T | Synthetic conversations, instruction datasets, tool-use traces |
 
-**Wall-clock time (1024–2048 H100s):** ~**3–6 months** for full three-stage pretraining. Roughly 70% of compute in Stage 1 (foundation), 20% in Stage 2 (long context), 10% in Stage 3 (refinement). Post-training (SFT → RM → RLHF → Constitutional AI) adds another **~6–8 weeks**.
+**Wall-clock time (2,048–4,096 B200-class GPUs, fp8):** ~**3–6 months** for full three-stage pretraining — ≈8–10M B200-hours at 40–50% MFU. (The bf16 Hopper fallback needs ≈36–45M H100-hours; a 1024–2048-H100 cluster would take years, not months.) Roughly 70% of compute in Stage 1 (foundation), 20% in Stage 2 (long context), 10% in Stage 3 (refinement). Post-training (SFT → RM → RLHF → Constitutional AI) adds another **~6–8 weeks**.
 
-**FLOPs budget:** ~10²⁵–10²⁶ training FLOPs. At 427B dense parameters and 25T tokens, the standard `6 × N × D` estimate gives `6 × 4.27×10¹¹ × 2.5×10¹³ ≈ 6.4×10²⁵` FLOPs — in the band. FP8 mixed-precision on Blackwell delivers this at ~2× the throughput of bf16-on-Hopper.
+**FLOPs budget:** ~10²⁵–10²⁶ training FLOPs. At 427B dense parameters and 25T tokens, the standard `6 × N × D` estimate gives `6 × 4.27×10¹¹ × 2.5×10¹³ ≈ 6.4×10²⁵` FLOPs — in the band. At B200 fp8 (4.5 PFLOPS dense, 40–50% MFU → 1.8–2.25×10¹⁵ FLOP/s sustained per GPU) that is ≈8–10M B200-hours.
 
-**Cost (compute alone, before salaries / data licensing):** **$10M–$50M** depending on the H100 hourly price and exact cluster utilization.
+**Cost (compute alone, before salaries / data licensing):** **$30M–$60M** — 8–10M B200-hours at $4–6/hr committed, varying with hourly price and exact cluster utilization.
 
 **Crawler discipline (`` 1.1.1):** A general-purpose crawler analogous to ClaudeBot must (a) honor `robots.txt`, (b) skip auth-walled pages, (c) skip CAPTCHA, (d) be transparently identifiable in user-agent strings.
 
@@ -487,7 +487,7 @@ Stage transitions are picked by validation loss elbows + downstream benchmark de
                                                               (see 3)
 ```
 
-Total: ~16 weeks pretraining + 6–8 weeks post-training = 22–24 weeks (~5–6 months) end-to-end on a 1024–2048 H100 cluster.
+Total: ~16 weeks pretraining + 6–8 weeks post-training = 22–24 weeks (~5–6 months) end-to-end on a 2,048–4,096-GPU Blackwell (fp8) cluster.
 
 #### Stage 1 — Foundation (~8 weeks, ~70% of compute)
 
@@ -582,7 +582,7 @@ These are surfaced repeatedly in `` 6.2.2.1 (training-time observations) and 7.3
 
 ### 2.7 Compute budget
 
-Per `` framing of frontier-model R&D: **10²⁵–10²⁶ FLOPs**, **1000–2000 H100 80GB GPUs for 3–6 months**, **$10–50M compute alone**.
+Per `` framing of frontier-model R&D: **10²⁵–10²⁶ FLOPs** (6·N·D ≈ 6.4×10²⁵ at 427B × 25T), **2,048–4,096 B200-class GPUs for 3–6 months** (≈8–10M B200-hours fp8; ≈36–45M H100-hours on the bf16 fallback), **$30–60M compute alone**.
 
 ### 2.8 Parallelism — TP × PP × DP, all three at once
 
@@ -591,7 +591,7 @@ Short answer: **all three.** A ~427B dense model does not fit on any single GPU 
 | Axis | Degree | What gets split | Communication |
 |---|---|---|---|
 | **Tensor parallel (TP)** | 8 | Each Linear layer's weight matrix sliced across GPUs (Megatron-style) | All-reduce per layer, NVLink within a node |
-| **Pipeline parallel (PP)** | 8 | Layers 0–13 on stage 0, 14–27 on stage 1, …, 96–109 on stage 7 | Activations passed between stages, InfiniBand |
+| **Pipeline parallel (PP)** | 8 | Layers 0–13 on stage 0, 14–27 on stage 1, …, 98–109 on stage 7 (110 ÷ 8 = 13.75 → stages are uneven) | Activations passed between stages, InfiniBand |
 | **Data parallel (DP, ZeRO-3)** | remaining GPUs | Optimizer state + gradients sharded across replicas | All-gather params on demand, reduce-scatter grads |
 | **Gradient accumulation** | 16 | Multiple micro-batches per optimizer step | none |
 
@@ -603,7 +603,7 @@ Short answer: **all three.** A ~427B dense model does not fit on any single GPU 
    │ GPU 0  GPU 1  ...  GPU 7│      │ GPU 0  GPU 1  ...  GPU 7│ ...  │ GPU 0  GPU 1  ...  GPU 7│
    │ ──TP group across 8─── │      │ ──TP group across 8─── │      │ ──TP group across 8─── │
    │      PP stage 0         │      │      PP stage 1         │      │      PP stage 7         │
-   │   layers 0..13          │      │   layers 14..27         │      │   layers 96..109        │
+   │   layers 0..13          │      │   layers 14..27         │      │   layers 98..109        │
    └────────┬────────────────┘      └────────┬────────────────┘      └────────┬────────────────┘
             └── InfiniBand / activations forward, gradients backward ──────┘
                             DP replica 0 (16 such replicas total)
@@ -612,17 +612,15 @@ Short answer: **all three.** A ~427B dense model does not fit on any single GPU 
    ╳ ZeRO-3 shards optimizer state + grads across the DP axis
 ```
 
-Per-step token math at this layout:
+Per-step token math at this layout (the YAML defaults):
 
 ```
-  micro_batch_per_replica = 32 sequences × 8192 tokens =  262,144 tokens
-  grad_accum                                            =        16
-  per-replica per-step                                  = 4,194,304 tokens
-  DP replicas                                           =        16
-  GLOBAL BATCH                                          ≈    67M tokens
+  micro-batch per replica  =  2 sequences × 8192 tokens  =    16,384 tokens
+  × grad_accum 16          →  per-replica per-step       =   262,144 tokens
+  × DP replicas 16         →  GLOBAL BATCH               = 4,194,304 tokens (4M)
 ```
 
-That's larger than the modelcard-aligned 4M default — operators tune the global batch by adjusting `dp_degree`, `grad_accum`, or per-replica micro-batch.
+That closes the batch identity `TrainingConfig.__post_init__` enforces — `global_batch_tokens = seq_len × micro_batch_size × grad_accum × dp_degree = 8192 × 2 × 16 × 16` — and operators tune the global batch by adjusting `dp_degree`, `grad_accum`, or `micro_batch_size`.
 
 **Why all three axes, not just one:**
 - **Pure DP** can't fit a 400B+ dense model on a single GPU's HBM (~850 GB at bf16, ~430 GB at fp8 — both exceed B200's 192 GB).
@@ -764,7 +762,7 @@ quantize_kv = dict(
 )
 ```
 
-`` notes int8 quantization unlocks "4× A100 80GB" inference for the full model (down from 8× at bf16). The cost is a small honesty regression on MASK / false-premise evaluations — measure and budget for it.
+int8 quantization unlocks "8× A100 80GB" inference for the full 427B model (427 GB of weights vs 640 GB of HBM, down from 16× at bf16 where weights alone are 854 GB). The cost is a small honesty regression on MASK / false-premise evaluations — measure and budget for it.
 
 ### 4.4 Sliding-window for long context
 
@@ -847,13 +845,13 @@ For a ~427B dense model (worked example), ordered by per-GPU capability (newest 
 
 ```
 Single-GPU (NVFP4):        1 × Rubin R100 288GB    # ≤200K ctx, NVFP4 weights+KV
-Single-GPU (fp8/int4):     1 × B300 279GB          # ≤200K ctx, int4 weights + fp8 KV
+Single-GPU (fp8/int4):     1 × B300 279GB          # ≤200K ctx, int4 weights + int8 KV (~258 GB)
 Standard (Rubin NVFP4):    2 × Rubin R100 288GB    # 1M ctx, NVFP4 — 2026+ default
 Standard (B300 fp8):       3-4 × B300 279GB        # 1M ctx, fp8 — 2025-2026
 Minimum (fp4 / int4):      2 × B200 192GB          # Blackwell entry point
-Memory-tight (int8):       4 × A100 80GB           # Ampere fallback
+Memory-tight (int8):       8 × A100 80GB           # Ampere fallback (427 GB weights vs 640; short ctx)
 Standard (fp8):            4 × B200 192GB          # Blackwell first-gen native
-Standard (bf16):           8 × A100 80GB           # Hopper / Ampere
+Standard (bf16):           16 × A100 80GB          # Hopper / Ampere (854 GB weights vs 1280)
 Optimal (low latency):     4 × Rubin R100  OR  4 × B300  OR  8 × B200  OR  16 × H100
 
 Sharding
@@ -866,7 +864,7 @@ Serving framework
     Triton Inference Server as the front door
 ```
 
-**The Blackwell-Ultra (B300) shift.** B300's 279 GB HBM3E (vs B200's 192 GB) is a 45% memory bump in the same generation, with FP4 dense throughput of 15 PFLOPS per GPU (vs B200's ~10) and 8 TB/s memory bandwidth. The headline implication for a 427B-class model: **a single B300 GPU fits int4 weights (~214 GB) plus a 200K-context KV cache (~88 GB at fp8 = ~302 GB total — borderline but workable with prefix caching)**, eliminating the cross-GPU TP collective from the per-token critical path at moderate context.
+**The Blackwell-Ultra (B300) shift.** B300's 279 GB HBM3E (vs B200's 192 GB) is a 45% memory bump in the same generation, with FP4 dense throughput of 15 PFLOPS per GPU (vs B200's ~10) and 8 TB/s memory bandwidth. The headline implication for a 427B-class model: **a single B300 GPU fits int4 weights (~214 GB) plus a 200K-context KV cache at int8 (~44 GB) ≈ 258 GB total**, eliminating the cross-GPU TP collective from the per-token critical path at moderate context. (At fp8 KV the 200K cache is ~88 GB and the ~302 GB working set spills past the 279 GB HBM — quantize the KV or cap context around 145K.)
 
 **The Rubin shift.** Rubin R100's 288 GB HBM4 plus 22 TB/s bandwidth (~2.8× B300's) and dedicated NVFP4 tensor cores (50 PFLOPS inference, 5× B200) means a single Rubin GPU comfortably fits a 427B-class model at NVFP4 (~214 GB weights + ~44 GB KV at 200K = ~258 GB), and the bandwidth headroom keeps the GPU compute-bound rather than memory-bandwidth-bound. **Single-GPU frontier-dense serving at moderate context becomes both feasible AND fast** on Rubin. For the full 1M context the working set still spills past one GPU, so 2× Rubin is the canonical 1M serving config — and the GB300 NVL72 / Vera Rubin NVL144 rack-scale form factors are what fleet operators deploy.
 

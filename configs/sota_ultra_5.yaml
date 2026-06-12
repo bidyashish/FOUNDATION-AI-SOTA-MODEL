@@ -110,12 +110,14 @@ training:
   # AdamW remains the safe 2026 default. Set to "shampoo" or "muon" if the
   # operator has validated that path at frontier scale.
   optimizer: adamw
-  lr: 2.5e-4             # nudged down from 4.7's 3e-4 for the wider d_model (width scaling)
+  # Width-scaled from 4.7's peak (LR ∝ 1/d_model, µP-style):
+  # 3e-4 × (16384 / 18432) ≈ 2.67e-4, committed at 2.5e-4 for fp8 headroom.
+  lr: 2.5e-4
   beta1: 0.9
   beta2: 0.95           # 2026 frontier convention; lower than Adam's 0.999
   weight_decay: 0.1
   grad_clip: 1.0
-  warmup_steps: 3000    # longer warmup for the larger model
+  warmup_steps: 3000    # 3000 × 8.39M tok/step ≈ 25B warmup tokens (0.07% of the 36T corpus)
   # Full-corpus optimizer-step budget at the base batch: 36T tokens / 8M
   # tokens-per-step ≈ 4.29M. training/schedule.py splits the tokens 70/20/10
   # → ~3.01M foundation / 0.86M long-context / 1.72M refinement (at batch/4).
@@ -243,10 +245,15 @@ implied_training_corpus:
 # 3.0–3.75e15 FLOP/s per GPU → 1.35e26 / sustained / 3600 ≈ 10–12.5M B300-hours.
 implied_compute:
   reference_training_platform: "GB300 NVL72 — 64 racks × 72 B300 279GB (4608 GPUs, ≈1.28 PB HBM3E)"
+  # The anchor every band below derives from: 6 × 627.06e9 × 36e12. Gate-checked
+  # against the model: section × the corpus commitment via
+  # ModelConfig.training_flops(); hour bands follow via config.gpu_hours().
+  training_flops_point_estimate: 1.354e+26   # signed exponent — PyYAML floats require it
   training_flops_band: "10^26 to 3×10^26"           # point estimate 6·N·D ≈ 1.35e26
   pretraining_blackwell_hours_band: "10M to 13M"    # B300 hours, fp8, 40–50% MFU
-  pretraining_h100_hours_band: "30M to 44M"         # Hopper fallback, bf16 (B300 fp8 ≈ 3.3× H100 bf16)
-  pretraining_wall_clock_weeks_band: "13 to 17"     # 10–13M hours ÷ 4608 GPUs = 13.0–16.9 weeks
+  pretraining_h100_hours_band: "76M to 95M"         # Hopper fallback, bf16: H100 ≈0.99 PFLOPS dense ×
+                                                    # 40–50% MFU → 1.35e26 ÷ 4.0–5.0e14 ÷ 3600 (B300 fp8 ≈ 7.6×/GPU)
+  pretraining_wall_clock_weeks_band: "13 to 17"     # 10–13M hours ÷ 4608 GPUs = 12.9–16.8 weeks
   post_training_wall_clock_weeks_band: "6 to 10"    # SFT + RM + RLHF + CAI
   pretraining_dollar_band_usd: "50M to 91M"         # 10–13M B300-hours × $5–7/hr committed
 
@@ -256,11 +263,11 @@ implied_compute:
 # from here so the schedule and this YAML cannot drift apart.
 implied_schedule_split:
   foundation_pct: 70
-  foundation_lr: 2.5e-4
+  foundation_lr: 2.5e-4   # = training.lr (gate-checked)
   long_context_pct: 20
-  long_context_lr: 8.0e-5
+  long_context_lr: 8.0e-5 # 0.32 × peak — the 4.7 ladder shape (1e-4/3e-4 = ⅓), width-scaled
   refinement_pct: 10
-  refinement_lr: 4.0e-5
+  refinement_lr: 4.0e-5   # 0.16 × peak — the 4.7 ladder shape (5e-5/3e-4 = ⅙), width-scaled
 
 # Implied capability targets — modelcard §8 scoreboard; release gates.
 # Values are the achieved UltraModel 5 (production, safeguards-on) numbers where
