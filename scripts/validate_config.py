@@ -10,6 +10,11 @@ caught at commit time instead of by hand:
                  (at recurrent_loops_max for depth-recurrent configs)
   recurrence     prelude/core/coda geometry, compute-params and virtual-depth
                  fields, monotone effort→loops ladder (looped configs only)
+  profile        implied_compute.serving_profile_of: the model: section (bar the
+                 loop ladder), training:, corpus and schedule split equal the
+                 base config's, loops_max is within the base's trained range,
+                 and the FLOPs anchor is the base run's — a profile serves the
+                 base's checkpoint and never pretrains anything
   training       batch identity (seq × micro × accum × dp = global batch),
                  total_steps ≈ corpus ÷ batch, schedule closes the corpus
                  at 70/20/10 with the implied_schedule_split LR ladder
@@ -102,6 +107,41 @@ def validate(path: Path, gate: Gate) -> None:
             f"{params_b:.2f}B vs committed {committed}B",
         )
 
+    # --- serving profile (same weights as a base config, fewer passes) ------
+    # `implied_compute.serving_profile_of` names the config whose checkpoint
+    # this file serves. The weights are the base's, so the stored stack,
+    # training section, corpus and schedule split must equal the base's; the
+    # loop count must stay inside the range the base run trained; and the
+    # compute anchor is the BASE run's 6·N·D — a profile never pretrains.
+    base_path = implied.get("implied_compute", {}).get("serving_profile_of")
+    base = None
+    base_implied: dict = {}
+    if base_path is not None:
+        base_path = Path(base_path)
+        base = ModelConfig.from_yaml(base_path)
+        base_implied = load_implied(base_path)
+        ladder_fields = {"recurrent_loops_max", "recurrent_loops_per_effort"}
+        drift = [
+            f.name for f in dataclasses.fields(ModelConfig)
+            if f.name not in ladder_fields and getattr(model, f.name) != getattr(base, f.name)
+        ]
+        gate.check(
+            not drift, f"profile shares the stored stack of {base_path}",
+            "drift: " + ", ".join(drift) if drift
+            else f"{params_b:.2f}B; model: section identical bar the loop ladder",
+        )
+        gate.check(
+            base.recurrent and 1 <= model.recurrent_loops_max <= base.recurrent_loops_max,
+            "profile loops_max within the base's trained range",
+            f"{model.recurrent_loops_max} vs base 1..{base.recurrent_loops_max}",
+        )
+        for section in ("implied_training_corpus", "implied_schedule_split"):
+            same = implied.get(section) == base_implied.get(section)
+            gate.check(same, f"profile inherits the base {section}",
+                       "identical" if same else "differs")
+    # Whose run produced the weights: the base's for a profile, else this file's.
+    trained = base if base is not None else model
+
     # --- depth recurrence (looped transformer) ------------------------------
     if model.recurrent:
         n_pre, n_core, n_coda = (
@@ -130,7 +170,7 @@ def validate(path: Path, gate: Gate) -> None:
             )
         for key, loops in (
             ("compute_params_billions_at_loops_max", model.recurrent_loops_max),
-            ("compute_params_billions_train_mean", model.expected_train_loops()),
+            ("compute_params_billions_train_mean", trained.expected_train_loops()),
         ):
             committed_c = scale.get(key)
             if committed_c is not None:
@@ -179,6 +219,10 @@ def validate(path: Path, gate: Gate) -> None:
         gate.check(False, "batch identity", str(e))
         train = None
     InferenceConfig.from_yaml(path)  # loads or raises
+    if base is not None and train is not None:
+        same = train == TrainingConfig.from_yaml(base_path)
+        gate.check(same, "profile inherits the base training: section",
+                   "identical" if same else "differs")
 
     corpus_t = implied.get("implied_training_corpus", {}).get("total_tokens_trillions")
     if train is not None and corpus_t:
@@ -194,14 +238,19 @@ def validate(path: Path, gate: Gate) -> None:
         # float() guards the PyYAML quirk: an unsigned exponent (1.354e26
         # instead of 1.354e+26) silently loads as a string.
         flops_committed = float(flops_committed)
-        flops = model.training_flops(corpus_t * 1e12)
-        n_used = model.estimate_compute_params_billions(model.expected_train_loops())
+        flops = trained.training_flops(corpus_t * 1e12)
+        n_used = trained.estimate_compute_params_billions(trained.expected_train_loops())
         gate.check(
             abs(flops - flops_committed) / flops_committed < 0.01,
-            "training FLOPs = 6·N·D",
+            "training FLOPs = 6·N·D" + (" of the base run" if base is not None else ""),
             f"{flops:.4g} vs committed {flops_committed:.4g} "
-            f"(N = {n_used:.2f}B compute params at mean loops {model.expected_train_loops():g})",
+            f"(N = {n_used:.2f}B compute params at mean loops {trained.expected_train_loops():g})",
         )
+        if base is not None:
+            base_anchor = base_implied.get("implied_compute", {}).get("training_flops_point_estimate")
+            base_anchor = float(base_anchor) if base_anchor is not None else float("nan")
+            gate.check(flops_committed == base_anchor, "profile inherits the base FLOPs anchor",
+                       f"{flops_committed:.4g} vs base {base_anchor:.4g}")
 
     split = implied.get("implied_schedule_split", {})
     if split:
@@ -295,7 +344,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "configs", nargs="*", type=Path,
-        default=[FLAGSHIP, Path("configs/sota_ultra_5_looped.yaml")],
+        default=[
+            FLAGSHIP,
+            Path("configs/sota_ultra_5_looped.yaml"),
+            Path("configs/sota_ultra_5_looped_2pass.yaml"),
+        ],
     )
     args = parser.parse_args()
 

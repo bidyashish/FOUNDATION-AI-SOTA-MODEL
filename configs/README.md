@@ -5,15 +5,19 @@ Central knob for the model. Everything in here traces back to a target in the Ul
 ## Files
 
 ```
-sota_ultra_5.yaml          UltraModel 5 — THE spec (model + training + inference + implied_* + gates)
-sota_ultra_5_looped.yaml   UltraModel 5 looped variant — same stored stack, depth-recurrent core
-                           (prelude 32 / shared core 64 / coda 32, 1–4 loops); all compute/KV numbers re-derived
+sota_ultra_5.yaml               UltraModel 5 — THE spec (model + training + inference + implied_* + gates)
+sota_ultra_5_looped.yaml        UltraModel 5 looped variant — same stored stack, depth-recurrent core
+                                (prelude 32 / shared core 64 / coda 32, 1–4 loops); all compute/KV numbers re-derived
+sota_ultra_5_looped_2pass.yaml  2-pass serving profile of the looped checkpoint — same weights, every effort
+                                tier at 2 loops (192 virtual layers, 937B compute params); nothing is trained from it
 ```
 
 `sota_ultra_5.yaml` is the single source for every default in the repo: the `config.py`
 dataclass defaults are a verbatim copy of its `model:` / `training:` / `inference:` sections,
 and `scripts/validate_config.py` fails if they drift. The looped file is derived from it and
-changes only the recurrence block (and everything that arithmetic implies).
+changes only the recurrence block (and everything that arithmetic implies). The 2-pass file is
+a *serving profile* of the looped checkpoint: it flattens the loop ladder and inherits every
+training number from the looped file (`implied_compute.serving_profile_of`, gate-checked).
 
 ### The spec: `sota_ultra_5.yaml` (UltraModel 5)
 
@@ -63,10 +67,33 @@ The 1M context, 200K compaction trigger, and 2576px / 3.75 MP image cap are unch
 (all modelcard-pinned). The `implied_*` section structure is identical, so
 `load_implied()`, `resolve_sources_from_yaml()`, and `ReleaseGate` work against either file.
 
+### 2-pass serving profile: `sota_ultra_5_looped_2pass.yaml`
+
+Serves the **same checkpoint** as `sota_ultra_5_looped.yaml` with every effort tier fixed at
+2 loops — same base weights, fewer passes. Nothing is trained from this file: the `training:`
+section, corpus, schedule split and the 6·N·D anchor are the looped run's, and
+`implied_compute.serving_profile_of` makes the gate check that they are identical. Arithmetic,
+efficiency and caveats: [`docs/LOOPED_2PASS_PROFILE.md`](../docs/LOOPED_2PASS_PROFILE.md).
+
+| Knob | UltraModel 5 looped (base) | 2-pass profile |
+|---|---|---|
+| `recurrent_loops_max`; `recurrent_loops_per_effort` | 4; min 1 / low 1 / medium 2 / high 3 / max 4 | 2; every tier → 2 |
+| stored params (checkpoint) | 627.06B | **627.06B — the same file** |
+| virtual layers / compute params per token | 128–320 / 627–1557B by tier | 192 / 936.90B at every tier (`compute_params_billions_at_loops_max: 937`) |
+| KV per token bf16 / fp8 (provisioned at `loops_max`) | 2880 / 1440 KiB | 1728 / 864 KiB (0.6×); `kv_cache_kib_per_token_bf16_at_loops_1: 1152` unchanged |
+| KV @ 1M, bf16 / fp8 | 2880 / 1440 GiB | 1728 / 864 GiB |
+| `training:`, corpus, LR ladder, 6·N·D anchor, hour/$ bands, `compute_params_billions_train_mean` | 36T, 2.358×10²⁶, 1092B at mean loops 2.5 | identical — inherited from the base run |
+
+Extra gate checks on a profile: the `model:` section equals the base's bar the two ladder
+fields, `training:` / `implied_training_corpus` / `implied_schedule_split` equal the base's,
+`recurrent_loops_max` is within the base's trained range, and the FLOPs anchor equals the
+base's and its 6·N·D — so a profile can never claim a cheaper pretraining run than the one
+that produced its weights.
+
 ## How the YAML maps to dataclasses
 
 ```
-sota_ultra_5.yaml   (and sota_ultra_5_looped.yaml)
+sota_ultra_5.yaml   (and sota_ultra_5_looped.yaml, sota_ultra_5_looped_2pass.yaml)
 ├── model:         → src/sota_model/config.py::ModelConfig
 ├── training:      → src/sota_model/config.py::TrainingConfig
 └── inference:     → src/sota_model/config.py::InferenceConfig
@@ -285,7 +312,7 @@ Every numeric relationship in these YAMLs is enforced by the config gate — run
 any edit, before committing:
 
 ```bash
-make check          # py_compile everything + validate both configs
+make check          # py_compile everything + validate all three configs
 make validate       # just the config gate
 python scripts/validate_config.py configs/sota_ultra_5.yaml   # one config
 ```
@@ -294,13 +321,13 @@ It checks ~20 invariants per config: head/hidden arithmetic, YaRN context covera
 params vs `implied_scale`, KV-cache math, the batch identity
 (seq × micro × accum × dp = global batch), `total_steps` vs the corpus commitment,
 schedule closure at 70/20/10 with the `implied_schedule_split` LR ladder, TP/PP
-shardability, recurrence geometry, mix percentages, gate numericity, the
-special-token/language counts, and — for the flagship — that the `config.py` dataclass
-defaults equal the YAML. CI runs the same gate on every push (`.github/workflows/check.yml`).
+shardability, recurrence geometry, serving-profile inheritance (`serving_profile_of`), mix
+percentages, gate numericity, the special-token/language counts, and — for the flagship —
+that the `config.py` dataclass defaults equal the YAML. CI runs the same gate on every push (`.github/workflows/check.yml`).
 
 ## How to override
 
-Don't edit `sota_ultra_5.yaml` (or `sota_ultra_5_looped.yaml`) for ad-hoc experiments — copy it:
+Don't edit `sota_ultra_5.yaml` (or either looped file) for ad-hoc experiments — copy it:
 
 ```bash
 cp configs/sota_ultra_5.yaml configs/sota_ultra_5_smoke.yaml

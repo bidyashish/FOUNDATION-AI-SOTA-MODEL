@@ -188,6 +188,12 @@ with tokens), loops are *per-token* (every token gets deeper, latency ∝ loops,
 with depth). A query that needs long exploration wants tokens; a query that needs a few
 hard inferences wants depth. The effort head picks the tier; the tier sets both.
 
+A deployment that wants one fixed depth instead of the ladder is a *serving profile* of the
+same checkpoint: `configs/sota_ultra_5_looped_2pass.yaml` pins every tier at 2 loops (192
+virtual layers, 937 B compute params, KV 0.6× the 4-pass provisioning) and inherits every
+training number from this file under a gate check. Arithmetic and what it saves:
+[`LOOPED_2PASS_PROFILE.md`](./LOOPED_2PASS_PROFILE.md).
+
 **Prefill protocol** (`inference/engine.py::_run`). The loop count is a per-sequence
 constant because the KV layout depends on it, but the effort head only exists after a
 prefill. So: prefill at the *probe* depth (the forced tier's loops, else

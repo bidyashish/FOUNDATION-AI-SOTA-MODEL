@@ -23,7 +23,7 @@ commitment, or the hardware story — and the config gate enforces that arithmet
 
 ```bash
 make check                                   # the pre-commit gate: py_compile + config validation
-make validate                                # just scripts/validate_config.py (both configs)
+make validate                                # just scripts/validate_config.py (all three configs)
 python scripts/validate_config.py configs/sota_ultra_5.yaml   # one config
 make smoke                                   # CLI wiring (--help on both trainers)
 make help
@@ -56,7 +56,13 @@ make help
   depth and are gate-checked; stored params do not change. Design: `docs/LOOPED_TRANSFORMER.md`.
   Anything that walks the layers must go through `SOTAModel.run_blocks` / `unrolled_blocks`,
   never `model.layers` directly.
-- Never edit `sota_ultra_5.yaml` (or the looped variant) for ad-hoc experiments — copy it (see
+- **`configs/sota_ultra_5_looped_2pass.yaml`** — a *serving profile* of the looped checkpoint: same
+  weights, every effort tier fixed at 2 loops (192 virtual layers, 937B compute params, KV 0.6× the
+  4-pass provisioning). `implied_compute.serving_profile_of` names the base; the gate then requires
+  the `model:` section (bar the loop ladder), `training:`, corpus and schedule split to equal the
+  base's and the 6·N·D anchor to be the base run's — a profile never pretrains anything. Reuse the
+  same pattern for any future "same weights, N passes" file. Doc: `docs/LOOPED_2PASS_PROFILE.md`.
+- Never edit `sota_ultra_5.yaml` (or either looped file) for ad-hoc experiments — copy it (see
   `configs/README.md`).
 - YAML sections `model:`/`training:`/`inference:` load into `ModelConfig`/`TrainingConfig`/
   `InferenceConfig`. The `implied_*` sections + `capability_targets`/`safety_thresholds` are NOT
@@ -81,6 +87,10 @@ make help
 - **Recurrence geometry** (`ModelConfig.__post_init__` + validator): `prelude + core + coda =
   n_layers`, every effort tier's loops in `[1, loops_max]`, ladder monotone; `implied_scale`
   recurrence fields match `estimate_compute_params_billions()` / `n_virtual_layers()`.
+- **Serving-profile inheritance** (`implied_compute.serving_profile_of`): the profile's `model:`
+  section equals the base's except `recurrent_loops_max` / `recurrent_loops_per_effort`;
+  `loops_max` ≤ the base's; `training:`, corpus and schedule split identical; FLOPs anchor equals
+  the base's and 6·N·D is computed from the *base* model at its mean loops.
 - Release-gate keys follow a suffix convention parsed by `evaluation/release_gate.py`:
   `*_min`/`*_min_pct` are floors, `*_max`/`*_max_pct` ceilings; `*_band` string values are
   qualitative and skipped.

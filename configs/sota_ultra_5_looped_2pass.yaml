@@ -1,12 +1,15 @@
-# SOTA dense model config — UltraModel 5 *looped* variant (depth-recurrent core).
-# Derived from `sota_ultra_5.yaml`: identical width, heads, FFN, corpus, batch, LR ladder,
-# gates and serving stack. The ONLY architectural delta is that the middle 64 of the 128
-# stored layers are a weight-shared core re-entered up to 4 times per token, so one
-# 627B checkpoint serves at four depths (128 / 192 / 256 / 320 virtual layers) chosen by
-# the effort tier. At loops=1 this file *is* UltraModel 5. Everything that changes
-# downstream — compute params, 6·N·D, GPU-hours, KV footprint — is re-derived below and
-# gate-checked by scripts/validate_config.py. Design + research synthesis:
-# docs/LOOPED_TRANSFORMER.md. Flow walkthrough: docs/TRANSFORMER_FLOW.md §9.
+# SOTA dense model config — UltraModel 5 looped, *2-pass serving profile*.
+# Derived from `sota_ultra_5_looped.yaml` and serves THAT file's checkpoint: identical
+# stored stack (627B, prelude 32 / core 64 / coda 32), corpus, batch, LR ladder, gates and
+# serving stack. The ONLY delta is the latent-depth ladder: every effort tier re-enters the
+# shared core exactly twice (192 virtual layers, 937B compute params per token) instead of
+# 1–4 times chosen by tier. "Same base weights, fewer passes" is the pattern a public
+# Microsoft page (since edited; unverified) described for GPT-6.1 Sol vs GPT-6 Sol — used
+# here as a design pattern, not as a fact about any vendor. Do NOT pretrain from this file:
+# `training:`, the corpus and the compute anchor describe the base run that produced the
+# weights (`implied_compute.serving_profile_of`) and are gate-checked to equal it. The
+# post-training stages pin `recurrent_loops_max`, so pointing them at this file post-trains
+# at exactly 2 passes. Efficiency arithmetic, caveats, how to serve: docs/LOOPED_2PASS_PROFILE.md.
 #
 # All numeric targets traceable to the SOTA UltraModel 5 System Card (the source of truth).
 # The card pins nothing about depth recurrence; every recurrence number is operator-committed.
@@ -93,40 +96,32 @@ model:
   # `hybrid_attention_overrides(128, full_attention_layers=(0, -1))`.
   layer_overrides: {}
 
-  # --- Depth recurrence (looped transformer) ---------------------------------
-  # Stored stack of 128 unique layers split prelude 32 / core 64 / coda 32
-  # (25% / 50% / 25% — Huginn's P:R:C depth ratio, scaled). Chosen so the band
-  # edges fall on pipeline-stage boundaries at PP 8 (16 layers/stage →
-  # prelude = stages 0–1, core = stages 2–5, coda = stages 6–7); the layout gate
-  # warns if they don't. Core re-entered `loops` times with the prelude output
-  # added back on every entry (input injection; s_0 = 0, s_i = core(s_{i-1}+e)).
+  # --- Depth recurrence (looped transformer) — 2-pass serving profile ---------
+  # Same stored stack as the base: 128 unique layers split prelude 32 / core 64 /
+  # coda 32 (band edges on PP-8 stage boundaries), core re-entered with the
+  # prelude output added back on every entry (input injection). The base run
+  # sampled loops uniformly from 1..4 per optimizer step, so loops = 2 is a
+  # trained depth (25% of the base's steps) — this profile pins it, no retrain.
   #
-  #   loops   virtual layers   compute params (B)   use
-  #   1       32+ 64+32 = 128   627.06  (= UltraModel 5 exactly)   min / low effort
-  #   2       32+128+32 = 192   936.90                              medium
-  #   3       32+192+32 = 256  1246.75                              high
-  #   4       32+256+32 = 320  1556.59  (2.48× stored)              max
-  #   mean 2.5 (training)  224  1091.83  → the N in 6·N·D below
+  #   loops   virtual layers   compute params (B)                                 use
+  #   2       32+128+32 = 192   936.90  (1.49× stored; 0.60× the base's 1556.59 at 4)   every tier
   #
-  # Training samples loops uniformly from 1..4 per optimizer step
-  # (ModelConfig.sample_train_loops) so all four serving depths are trained;
-  # mean virtual depth 224 = 1.75× the base stack. Stored params, checkpoint
-  # size and weight-memory at serve time are unchanged at 627B.
-  # 4 loops (not Huginn's 32): at this width 320 virtual layers already exceeds
-  # any 2026 dense stack; KV at loops_max is 2.5× the base (see implied_scale)
-  # and bounds the choice. Raising loops_max later needs no retrain of width.
-  recurrent_prelude_layers: 32
-  recurrent_core_layers: 64
-  recurrent_loops_max: 4
-  # Second axis of the effort ladder (first axis = thinking_budgets, visible
-  # tokens): latent depth per tier. Monotone in effort; min/low share depth 1
-  # so the cheap tiers cost exactly UltraModel 5. Fixed per sequence at prefill.
+  # Why 2: 1 is UltraModel 5 itself (no latent depth); 4 is the base's max tier
+  # at 1557B compute + 2880 KiB/token KV. 2 is the smallest depth that adds latent
+  # reasoning over the flagship and the depth the base's `medium` tier already
+  # serves, so it is exercised by the base's gates. Whether a flat 2 holds the
+  # base's high/max-tier scores is NOT measured here — re-run the release gate.
+  recurrent_prelude_layers: 32   # = base; gate-checked equal (shared weights)
+  recurrent_core_layers: 64      # = base; gate-checked equal (shared weights)
+  recurrent_loops_max: 2         # ≤ base loops_max 4 (gate). KV storage is sized here → 0.6× the base's provisioning
+  # Flat ladder: the latent axis is fixed at 2 for every tier; the visible axis
+  # (thinking_budgets) still scales with tier. Non-decreasing, as the gate requires.
   recurrent_loops_per_effort:
-    min: 1
-    low: 1
+    min: 2
+    low: 2
     medium: 2
-    high: 3
-    max: 4
+    high: 2
+    max: 2
 
   vision_enabled: true
   vision_patch_size: 14
@@ -238,26 +233,25 @@ inference:
 # the §8 capability profile. Modelcard doesn't pin a number; current YAML lands
 # at the values below. Recompute via ModelConfig.estimate_params_billions().
 implied_scale:
-  total_params_billions: 627          # STORED params, derived from model: section (627.06B);
-                                      # the core is counted once — this is the checkpoint size
-  active_params_billions: 627         # dense; all stored params active per token at every depth
-  # Recurrence decouples stored params from per-token compute. Compute params at
-  # `loops` = stored + (loops−1) × core, core = 64 × (attn 18432×(18432+2×2304)+
+  total_params_billions: 627          # STORED params = the base checkpoint (627.06B); the core is
+                                      # counted once — this is the checkpoint size, shared with the base
+  active_params_billions: 627         # dense; all stored params active per token
+  # Compute params at loops 2 = stored + 1 × core, core = 64 × (attn 18432×(18432+2×2304)+
   # 18432×18432 + SwiGLU 3×18432×73728 + norms) ≈ 64 × 4.841B = 309.84B.
   # Gate-checked via ModelConfig.estimate_compute_params_billions():
-  compute_params_billions_at_loops_max: 1557     # 627.06 + 3 × 309.84 = 1556.59B (loops 4)
-  compute_params_billions_train_mean: 1092       # 627.06 + 1.5 × 309.84 = 1091.83B (mean loops 2.5)
-  virtual_layers_at_loops_max: 320               # 32 + 4×64 + 32
-  # KV cache is indexed by VIRTUAL layer, so it scales with loops, not with the
-  # 128 stored layers. Provisioning number = loops_max. Per-token at bf16:
-  # 320 × 18 × 128 × 2 (K+V) × 2 B = 2,949,120 B = 2880 KiB exactly (2.5× the base
-  # 1152 KiB). At a full 1M-token (= 1,048,576) context that is 2880 GiB exactly
-  # (≈ 3093 GB decimal). Field names use binary units (KiB/GiB) for exact
-  # arithmetic; fp8 (the default kv_cache_dtype) halves both. Per depth:
-  # loops 1 → 1152 KiB, 2 → 1728, 3 → 2304, 4 → 2880 (+576 KiB per loop).
-  kv_cache_kib_per_token_bf16: 2880            # at loops_max; fp8 → 1440 KiB/token
-  kv_cache_gib_at_1m_context_bf16: 2880        # at loops_max; fp8 → 1440 GiB
-  kv_cache_kib_per_token_bf16_at_loops_1: 1152 # = UltraModel 5; gate-checked
+  compute_params_billions_at_loops_max: 937      # 627.06 + 1 × 309.84 = 936.90B (loops 2 — the only depth served)
+  # Inherited from the base run that produced the weights (mean loops 2.5, not this
+  # file's 1.5): with serving_profile_of set, the gate checks it against the BASE.
+  compute_params_billions_train_mean: 1092       # 627.06 + 1.5 × 309.84 = 1091.83B (base run, mean loops 2.5)
+  virtual_layers_at_loops_max: 192               # 32 + 2×64 + 32
+  # KV cache is indexed by VIRTUAL layer; the profile provisions at loops 2:
+  # 192 × 18 × 128 × 2 (K+V) × 2 B = 1,769,472 B = 1728 KiB/token exactly
+  # (1.5× UltraModel 5's 1152, 0.6× the base's 2880 at loops 4). At a full
+  # 1M-token (= 1,048,576) context that is 1728 GiB exactly (≈ 1855 GB decimal).
+  # Binary units for exact arithmetic; fp8 (the default kv_cache_dtype) halves both.
+  kv_cache_kib_per_token_bf16: 1728            # at loops 2; fp8 → 864 KiB/token
+  kv_cache_gib_at_1m_context_bf16: 1728        # at loops 2; fp8 → 864 GiB
+  kv_cache_kib_per_token_bf16_at_loops_1: 1152 # = UltraModel 5; gate-checked (the base's loops-1 anchor)
 
 # Implied training corpus — modelcard 1.1.1 names the source mix but pins no
 # token count. Held at UltraModel 5's 36T: the looped variant changes compute
@@ -301,14 +295,18 @@ implied_training_corpus:
 # ~7.5 PFLOPS (FP4 dense 15, ~1.67× B200's 4.5 fp8), so 40–50% MFU sustains
 # 3.0–3.75e15 FLOP/s per GPU → 1.35e26 / sustained / 3600 ≈ 10–12.5M B300-hours.
 implied_compute:
+  # This file serves the checkpoint trained under the base config named here;
+  # every number in this section is the BASE run's. scripts/validate_config.py
+  # sees `serving_profile_of` and checks: model: section equal to the base bar the
+  # loop ladder, training: / corpus / schedule split equal, loops_max within the
+  # base's trained range, and the FLOPs anchor = 6·N·D of the BASE (mean loops 2.5).
+  # Training a 2-pass model from scratch would cost 6 × 781.98e9 × 36e12 = 1.689e26
+  # — that is NOT this profile's cost; its weights are already paid for.
+  serving_profile_of: configs/sota_ultra_5_looped.yaml
   reference_training_platform: "GB300 NVL72 — 64 racks × 72 B300 279GB (4608 GPUs, ≈1.28 PB HBM3E)"
-  # The anchor every band below derives from: 6 × N_compute(mean loops) × D =
-  # 6 × 1091.83e9 × 36e12 = 2.358e26 — 1.74× UltraModel 5's 1.354e26, because the
-  # core runs 2.5× on average (mean virtual depth 224 vs 128). Gate-checked against
-  # the model: section × the corpus commitment via ModelConfig.training_flops()
-  # (which uses expected_train_loops()); hour bands follow via config.gpu_hours().
-  # Per-loop-count cost at 36T: loops 1 → 1.35e26, 2 → 2.02e26, 3 → 2.69e26, 4 → 3.36e26.
-  training_flops_point_estimate: 2.358e+26   # signed exponent — PyYAML floats require it
+  # Base anchor: 6 × N_compute(mean loops 2.5) × D = 6 × 1091.83e9 × 36e12 = 2.358e26.
+  # Per-loop-count cost at 36T for reference: loops 1 → 1.35e26, 2 → 2.02e26, 4 → 3.36e26.
+  training_flops_point_estimate: 2.358e+26   # inherited from the base; signed exponent — PyYAML floats require it
   training_flops_band: "2×10^26 to 4×10^26"         # point estimate 6·N·D ≈ 2.36e26
   pretraining_blackwell_hours_band: "17M to 22M"    # B300 hours, fp8: 2.358e26 ÷ (7.5e15 × 0.40–0.50) ÷ 3600
                                                     # = 17.5M–21.8M
@@ -425,11 +423,14 @@ safety_thresholds:
 # context), so no single GPU holds a replica at any precision.
 # 2026 deployment band spans Hopper → Blackwell → Blackwell Ultra → Rubin.
 implied_serving_minimums:
-  # Weight memory is unchanged (627B stored). KV at 8K ctx grows with depth:
-  # loops 1 → 9.7 GB bf16, loops 4 → 24.2 GB bf16 (12.1 GB fp8/int8).
-  inference_int8_min_gpus: "8 x A100 80GB"    # 627 GB weights + 8K-ctx int8 KV @loops 4 = 639 GB vs 640 —
-                                              # short-context only, and KV must be int8 (bf16 KV → 651 GB, spills)
-  inference_bf16_min_gpus: "16 x A100 80GB"   # 1254 GB weights + 8K-ctx bf16 KV @loops 4 = 1278 GB vs 1280 — short-context only
+  # Weight memory is unchanged (627B stored). KV at 8K ctx is fixed at loops 2:
+  # 1728 KiB × 8192 = 14.5 GB bf16 (7.2 GB fp8/int8) vs the base's 24.2 GB at loops 4.
+  # The short-context minimums below are weight-bound, so they equal the base's;
+  # the profile's saving appears at long context (1M fp8/fp8: 6 × B300 vs 8 for the
+  # base; 200K int4-weight + fp8-KV: 2 × B300 vs 3) — table in docs/LOOPED_2PASS_PROFILE.md.
+  inference_int8_min_gpus: "8 x A100 80GB"    # 627 GB weights + 8K-ctx int8 KV @loops 2 = 634 GB vs 640 —
+                                              # short-context only (bf16 KV → 642 GB, spills)
+  inference_bf16_min_gpus: "16 x A100 80GB"   # 1254 GB weights + 8K-ctx bf16 KV @loops 2 = 1269 GB vs 1280 — short-context only
   inference_optimal_hopper_gpus: "24 x H100 80GB"
   inference_fp8_blackwell_gpus: "8 x B200 192GB"
   inference_fp8_blackwell_ultra_gpus: "6 x B300 279GB"   # late 2025+; 45% more HBM than B200
