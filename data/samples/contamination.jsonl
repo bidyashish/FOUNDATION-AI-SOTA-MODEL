@@ -1,0 +1,42 @@
+{"id": "contam-url-hle-1", "url": "https://lastexam.ai/questions/2501.14249", "lang": "en", "text": "Some prose that itself looks innocuous but the URL must trigger the blocklist."}
+{"id": "contam-url-hle-2", "url": "https://huggingface.co/datasets/cais/hle", "lang": "en", "text": "Anything from this URL must be dropped."}
+{"id": "contam-url-hle-3", "url": "https://github.com/centerforaisafety/hle/blob/main/README.md", "lang": "en", "text": "HLE repo content."}
+{"id": "contam-url-agi", "url": "https://agi.safe.ai/", "lang": "en", "text": "Last-exam.ai mirror."}
+{"id": "contam-text-swe-bench", "url": "https://example.com/blog", "lang": "en", "text": "On SWE-bench Verified the model achieved 87.6 percent. The exact instance was..."}
+{"id": "contam-text-swe-bench-pro", "url": "https://example.com/blog", "lang": "en", "text": "SWE-bench Pro is harder because the diffs span multiple files."}
+{"id": "contam-text-swe-bench-multi", "url": "https://example.com/blog", "lang": "en", "text": "SWE-bench Multilingual covers nine programming languages."}
+{"id": "contam-text-swe-bench-multimodal", "url": "https://example.com/blog", "lang": "en", "text": "SWE-bench Multimodal includes design mockups and screenshots."}
+{"id": "contam-text-terminal-bench", "url": "https://example.com/blog", "lang": "en", "text": "Terminal-Bench 2.0 tests command-line task completion in container environments."}
+{"id": "contam-text-gpqa", "url": "https://example.com/blog", "lang": "en", "text": "Recent results on GPQA Diamond: the model scored above 94 percent..."}
+{"id": "contam-text-usamo", "url": "https://example.com/blog", "lang": "en", "text": "The USAMO 2026 problems were graded by a panel of three frontier-model judges."}
+{"id": "contam-text-graphwalks", "url": "https://example.com/blog", "lang": "en", "text": "GraphWalks BFS at 256K-1M tokens evaluates multi-hop long-context reasoning."}
+{"id": "contam-text-mrcr", "url": "https://example.com/blog", "lang": "en", "text": "OpenAI MRCR v2 8-needle benchmark at 1M tokens."}
+{"id": "contam-text-hle", "url": "https://example.com/blog", "lang": "en", "text": "Humanity's Last Exam covers 17 fields and is currently used as the canonical agentic-search benchmark."}
+{"id": "contam-text-browsecomp", "url": "https://example.com/blog", "lang": "en", "text": "BrowseComp evaluates an agent's ability to find hard-to-locate information on the open web."}
+{"id": "contam-text-deepsearchqa", "url": "https://example.com/blog", "lang": "en", "text": "DeepSearchQA is a 900-prompt benchmark for evaluating multi-step information-seeking."}
+{"id": "contam-text-draco", "url": "https://example.com/blog", "lang": "en", "text": "DRACO benchmark: Deep Research Accuracy, Completeness, and Objectivity."}
+{"id": "contam-text-labbench", "url": "https://example.com/blog", "lang": "en", "text": "LAB-Bench FigQA tests interpretation of complex scientific figures from biology research papers."}
+{"id": "contam-text-charxiv", "url": "https://example.com/blog", "lang": "en", "text": "CharXiv Reasoning is built from 2,323 real-world charts sourced from arXiv papers."}
+{"id": "contam-text-screenspot", "url": "https://example.com/blog", "lang": "en", "text": "ScreenSpot-Pro is a GUI grounding benchmark across 23 professional applications."}
+{"id": "contam-text-osworld", "url": "https://example.com/blog", "lang": "en", "text": "OSWorld evaluates agents on a live Ubuntu virtual machine via mouse and keyboard."}
+{"id": "contam-text-officeqa", "url": "https://example.com/blog", "lang": "en", "text": "OfficeQA Pro is an enterprise benchmark for end-to-end grounded reasoning over Office documents."}
+{"id": "contam-text-finance", "url": "https://example.com/blog", "lang": "en", "text": "Finance Agent benchmark from Vals AI assesses research over public-company SEC filings."}
+{"id": "contam-text-mcp-atlas", "url": "https://example.com/blog", "lang": "en", "text": "MCP-Atlas measures multi-step Model Context Protocol tool-use workflows."}
+{"id": "contam-text-vending", "url": "https://example.com/blog", "lang": "en", "text": "Vending-Bench 2 simulates running a vending machine business over a year-long horizon."}
+{"id": "contam-text-gdpval", "url": "https://example.com/blog", "lang": "en", "text": "GDPval-AA tests AI on economically valuable real-world professional tasks."}
+{"id": "contam-text-arc-1", "url": "https://example.com/blog", "lang": "en", "text": "ARC-AGI-1 measures fluid intelligence on novel input-output pairs."}
+{"id": "contam-text-arc-2", "url": "https://example.com/blog", "lang": "en", "text": "ARC-AGI-2 measures fluid intelligence given only a handful of input-output pairs."}
+{"id": "contam-text-mmmlu", "url": "https://example.com/blog", "lang": "en", "text": "MMMLU tests knowledge and reasoning across 57 academic subjects in 14 non-English languages."}
+{"id": "contam-text-gmmlu", "url": "https://example.com/blog", "lang": "en", "text": "Cohere Labs Global MMLU (GMMLU) extends MMLU across 42 languages."}
+{"id": "contam-text-milu", "url": "https://example.com/blog", "lang": "en", "text": "AI4Bharat MILU is the Multi-task Indic Language Understanding benchmark across 10 Indic languages."}
+{"id": "contam-text-include", "url": "https://example.com/blog", "lang": "en", "text": "INCLUDE benchmark covers 44 languages with regional academic and professional examination questions."}
+{"id": "contam-text-eclektic", "url": "https://example.com/blog", "lang": "en", "text": "Google ECLeKTic tests cross-lingual knowledge transfer across twelve languages."}
+{"id": "contam-text-biopipeline", "url": "https://example.com/blog", "lang": "en", "text": "BioPipelineBench Verified assesses execution of bioinformatics workflows."}
+{"id": "contam-text-biomystery", "url": "https://example.com/blog", "lang": "en", "text": "BioMysteryBench Verified is a hard analytical biology challenge with unprocessed datasets."}
+{"id": "contam-text-cybench", "url": "https://example.com/blog", "lang": "en", "text": "Cybench is a public cyber capabilities benchmark from CTF challenges."}
+{"id": "contam-text-cybergym", "url": "https://example.com/blog", "lang": "en", "text": "CyberGym tests targeted vulnerability reproduction in real open-source projects."}
+{"id": "contam-text-shade", "url": "https://example.com/blog", "lang": "en", "text": "SHADE-Arena pairs a long-horizon agentic main task with a harmful side task."}
+{"id": "contam-text-petri", "url": "https://example.com/blog", "lang": "en", "text": "Petri 2.0 is the open-source automated behavioral audit tool."}
+{"id": "contam-text-mask", "url": "https://example.com/blog", "lang": "en", "text": "MASK benchmark tests whether a model contradicts its own stated belief under pressure."}
+{"id": "contam-text-aa-omni", "url": "https://example.com/blog", "lang": "en", "text": "AA-Omniscience is a 42-topic closed-book factuality benchmark."}
+{"id": "contam-text-bbq", "url": "https://example.com/blog", "lang": "en", "text": "Bias Benchmark for Question Answering (BBQ) tests model bias in ambiguous and disambiguated questions."}
